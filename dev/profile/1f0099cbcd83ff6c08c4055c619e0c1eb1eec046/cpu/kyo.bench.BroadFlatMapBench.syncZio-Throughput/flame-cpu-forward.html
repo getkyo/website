@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 800px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>CPU profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(50);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,497,3,'all')
+f(1,0,5,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(2,0,5,3,'thread_native_entry(Thread*)')
+f(3,0,5,4,'Thread::call_run()')
+f(4,0,4,4,'GangWorker::run()')
+f(5,0,4,4,'GangWorker::loop()')
+f(6,0,1,4,'G1BatchedGangTask::work(unsigned int)')
+f(7,0,1,4,'G1PostEvacuateCollectionSetCleanupTask2::FreeCollectionSetTask::do_work(unsigned int)')
+f(8,0,1,4,'G1CollectionSet::par_iterate(HeapRegionClosure*, HeapRegionClaimer*, unsigned int, unsigned int) const')
+f(9,0,1,4,'G1CollectionSet::iterate_part_from(HeapRegionClosure*, HeapRegionClaimer*, unsigned long, unsigned long, unsigned int, unsigned int) const [clone .part.0]')
+f(10,0,1,4,'TruncatedSeq::add(double)')
+f(6,1,2,4,'G1EvacuateRegionsBaseTask::work(unsigned int)')
+f(7,1,2,4,'G1EvacuateRegionsTask::scan_roots(G1ParScanThreadState*, unsigned int)')
+f(8,1,1,4,'G1RemSet::scan_heap_roots(G1ParScanThreadState*, unsigned int, G1GCPhaseTimes::GCParPhases, G1GCPhaseTimes::GCParPhases, bool)')
+f(9,1,1,4,'G1ScanHRForRegionClosure::scan_heap_roots(HeapRegion*)')
+f(10,1,1,4,'void OopOopIterateDispatch<G1ScanCardClosure>::Table::oop_oop_iterate<InstanceKlass, narrowOop>(G1ScanCardClosure*, oopDesc*, Klass*)')
+f(8,2,1,4,'G1RootProcessor::evacuate_roots(G1ParScanThreadState*, unsigned int)')
+f(9,2,1,4,'G1RootProcessor::process_java_roots(G1RootClosures*, G1GCPhaseTimes*, unsigned int)')
+f(10,2,1,4,'Threads::possibly_parallel_oops_do(bool, OopClosure*, CodeBlobClosure*)')
+f(11,2,1,4,'JavaThread::oops_do_frames(OopClosure*, CodeBlobClosure*) [clone .part.0]')
+f(12,2,1,4,'frame::oops_interpreted_do(OopClosure*, RegisterMap const*, bool) const')
+f(6,3,1,4,'G1PrepareEvacuationTask::work(unsigned int)')
+f(7,3,1,4,'HeapRegionManager::par_iterate(HeapRegionClosure*, HeapRegionClaimer*, unsigned int) const')
+f(8,3,1,4,'G1RemSet::prepare_region_for_scan(HeapRegion*)')
+f(4,4,1,4,'VMThread::run()')
+f(5,4,1,4,'VMThread::inner_execute(VM_Operation*)')
+f(6,4,1,4,'VMThread::evaluate_operation(VM_Operation*)')
+f(7,4,1,4,'VM_Operation::evaluate()')
+f(8,4,1,4,'VM_G1CollectForAllocation::doit()')
+f(9,4,1,4,'G1CollectedHeap::do_collection_pause_at_safepoint(double)')
+f(10,4,1,4,'G1GCPhaseTimes::note_gc_start()')
+f(1,5,492,1,'java/lang/Thread.run')
+f(2,5,492,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(3,5,492,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(4,5,492,1,'java/util/concurrent/FutureTask.run')
+f(5,5,492,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(6,5,492,1,'java/util/concurrent/FutureTask.run')
+f(7,5,492,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(8,5,492,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(9,5,492,1,'java/lang/reflect/Method.invoke')
+f(10,5,492,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(11,5,492,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(12,5,492,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(13,5,492,1,'kyo/bench/jmh_generated/BroadFlatMapBench_syncZio_jmhTest.syncZio_Throughput')
+f(14,5,492,1,'kyo/bench/jmh_generated/BroadFlatMapBench_syncZio_jmhTest.syncZio_thrpt_jmhStub',0,1,0)
+f(15,6,491,1,'kyo/bench/Bench.syncZio')
+f(16,6,491,1,'zio/Unsafe$.unsafe')
+f(17,6,491,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2c000.apply')
+f(18,6,491,1,'kyo/bench/Bench.syncZio$$anonfun$1',2,0,0)
+f(19,6,1,1,'kyo/bench/BroadFlatMapBench.zioBench')
+f(20,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(21,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(22,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(23,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(24,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(25,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(26,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(27,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(28,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(29,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(30,6,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(31,6,1,2,'zio/ZIO$OnSuccess.flatMap',1,0,0)
+f(32,6,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(33,6,1,2,'zio/ZIO.flatMap',1,0,0)
+f(34,6,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(19,7,490,1,'zio/Runtime$UnsafeAPIV1.run',2,0,0)
+f(20,7,490,1,'zio/Runtime$UnsafeAPIV1.runOrFork',2,0,0)
+f(21,8,1,3,'clock_gettime')
+f(22,8,1,3,'[vdso]')
+f(21,9,488,1,'zio/internal/FiberRuntime.start')
+f(22,9,488,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(23,9,1,2,'zio/internal/FiberRuntime.getSupervisor',1,0,0)
+f(24,9,1,2,'zio/internal/FiberRuntime.getFiberRef',1,0,0)
+f(25,9,1,2,'zio/FiberRefs.getOrDefault',1,0,0)
+f(26,9,1,2,'zio/FiberRefs.get',1,0,0)
+f(27,9,1,2,'scala/Option.map',1,0,0)
+f(23,10,487,1,'zio/internal/FiberRuntime.runLoop')
+f(24,10,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply')
+f(25,10,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2')
+f(26,10,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(27,10,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(28,10,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(29,10,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(24,11,486,1,'zio/internal/FiberRuntime.runLoop')
+f(25,11,486,1,'zio/internal/FiberRuntime.runLoop')
+f(26,13,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply')
+f(27,13,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2')
+f(28,13,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(29,14,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(30,14,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(31,14,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(32,14,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(33,14,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(34,14,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(35,14,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(36,14,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(26,15,1,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',1,0,0)
+f(27,15,1,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',1,0,0)
+f(28,15,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(29,15,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(30,15,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(26,16,1,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',1,0,0)
+f(27,16,1,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',1,0,0)
+f(28,16,1,2,'java/util/concurrent/ConcurrentLinkedQueue.first',1,0,0)
+f(26,17,480,1,'zio/internal/FiberRuntime.runLoop')
+f(27,17,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply')
+f(28,17,5,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2')
+f(29,17,5,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(30,18,3,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(31,18,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(32,18,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(33,18,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(34,18,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(35,18,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(36,18,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(32,19,1,2,'zio/ZIO$OnSuccess.flatMap',1,0,0)
+f(33,19,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(34,19,1,2,'zio/ZIO.flatMap',1,0,0)
+f(35,19,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(31,20,1,1,'zio/ZIO$Sync.flatMap')
+f(32,20,1,1,'zio/ZIO.flatMap$')
+f(33,20,1,1,'zio/ZIO.flatMap')
+f(34,20,1,1,'zio/ZIO$OnSuccess$.apply')
+f(35,20,1,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(36,20,1,4,'InstanceKlass::allocate_instance(JavaThread*)')
+f(37,20,1,4,'ObjAllocator::initialize(HeapWordImpl**) const')
+f(30,21,1,2,'zio/ZIO$OnSuccess.flatMap',1,0,0)
+f(31,21,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(32,21,1,2,'zio/ZIO.flatMap',1,0,0)
+f(33,21,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(27,22,1,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',1,0,0)
+f(28,22,1,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',1,0,0)
+f(29,22,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(30,22,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(31,22,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(27,23,474,1,'zio/internal/FiberRuntime.runLoop')
+f(28,25,6,1,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply',1,0,0)
+f(29,25,6,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',1,0,0)
+f(30,25,1,3,'itable stub')
+f(30,26,5,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(31,26,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(32,26,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(33,26,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(31,27,4,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(32,27,2,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',2,0,0)
+f(33,27,2,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',2,0,0)
+f(34,27,2,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',2,0,0)
+f(32,29,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(33,29,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(34,30,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(35,30,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(36,30,1,2,'zio/ZIO$Sync.flatMap',1,0,0)
+f(37,30,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(38,30,1,2,'zio/ZIO.flatMap',1,0,0)
+f(39,30,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(28,31,3,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',3,0,0)
+f(29,31,3,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',3,0,0)
+f(30,31,3,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',3,0,0)
+f(31,31,3,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',3,0,0)
+f(32,31,3,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',3,0,0)
+f(28,34,463,1,'zio/internal/FiberRuntime.runLoop')
+f(29,37,13,1,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply',3,0,0)
+f(30,37,13,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',3,0,0)
+f(31,38,2,3,'itable stub')
+f(31,40,9,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(32,42,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(33,42,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(34,42,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(32,43,4,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(33,43,4,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(34,43,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(35,43,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(36,43,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(34,44,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(35,44,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(36,44,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(37,44,2,2,'zio/ZIO$.succeed',2,0,0)
+f(38,44,2,2,'zio/ZIOCompanionVersionSpecific.succeed$',2,0,0)
+f(39,44,2,2,'zio/ZIOCompanionVersionSpecific.succeed',2,0,0)
+f(40,45,1,2,'zio/ZIO$Sync$.apply',1,0,0)
+f(34,46,1,2,'zio/ZIO$.succeed',1,0,0)
+f(35,46,1,2,'zio/ZIOCompanionVersionSpecific.succeed$',1,0,0)
+f(36,46,1,2,'zio/ZIOCompanionVersionSpecific.succeed',1,0,0)
+f(32,47,2,2,'zio/ZIO$OnSuccess.flatMap',2,0,0)
+f(33,47,2,2,'zio/ZIO.flatMap$',2,0,0)
+f(34,47,2,2,'zio/ZIO.flatMap',2,0,0)
+f(35,47,2,2,'zio/ZIO$OnSuccess$.apply',2,0,0)
+f(31,49,1,1,'zio/ZIO$OnSuccess.flatMap')
+f(32,49,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(33,49,1,2,'zio/ZIO.flatMap',1,0,0)
+f(34,49,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(29,50,3,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',3,0,0)
+f(30,50,3,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',3,0,0)
+f(31,50,3,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',3,0,0)
+f(32,50,3,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',3,0,0)
+f(33,50,2,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',2,0,0)
+f(33,52,1,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.<init>',1,0,0)
+f(29,53,2,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(30,53,2,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(31,53,2,1,'zio/Unsafe$.unsafe')
+f(32,53,2,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d3f940.apply')
+f(33,53,2,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(34,53,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.apply')
+f(35,53,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1$$anonfun$1')
+f(36,53,2,1,'scala/math/BigInt.$plus')
+f(37,54,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(38,54,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(29,55,2,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',2,0,0)
+f(30,56,1,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',1,0,0)
+f(29,57,440,1,'zio/internal/FiberRuntime.runLoop')
+f(30,68,24,2,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply',8,0,0)
+f(31,68,24,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',8,0,0)
+f(32,69,7,3,'itable stub')
+f(32,76,14,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(33,76,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(34,76,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(35,76,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(33,77,13,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(34,79,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(35,79,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(36,79,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(34,80,9,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(35,81,2,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',2,0,0)
+f(36,81,2,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',2,0,0)
+f(37,81,2,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',2,0,0)
+f(35,83,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(36,83,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(37,84,1,2,'zio/ZIO$.succeed',1,0,0)
+f(38,84,1,2,'zio/ZIOCompanionVersionSpecific.succeed$',1,0,0)
+f(39,84,1,2,'zio/ZIOCompanionVersionSpecific.succeed',1,0,0)
+f(40,84,1,2,'zio/ZIO$Sync$.apply',1,0,0)
+f(35,85,2,2,'zio/ZIO$.succeed',2,0,0)
+f(36,85,2,2,'zio/ZIOCompanionVersionSpecific.succeed$',2,0,0)
+f(37,85,2,2,'zio/ZIOCompanionVersionSpecific.succeed',2,0,0)
+f(38,85,2,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',2,0,0)
+f(39,85,2,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',2,0,0)
+f(40,85,2,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',2,0,0)
+f(35,87,2,2,'zio/ZIO$Sync.flatMap',2,0,0)
+f(36,87,2,2,'zio/ZIO.flatMap$',2,0,0)
+f(37,87,2,2,'zio/ZIO.flatMap',2,0,0)
+f(38,87,2,2,'zio/ZIO$OnSuccess$.apply',2,0,0)
+f(34,89,1,2,'zio/ZIO$Sync.flatMap',1,0,0)
+f(35,89,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(36,89,1,2,'zio/ZIO.flatMap',1,0,0)
+f(37,89,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(38,89,1,2,'zio/ZIO$OnSuccess.<init>',1,0,0)
+f(32,90,2,1,'zio/ZIO$OnSuccess.flatMap')
+f(30,92,6,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',6,0,0)
+f(31,92,6,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',6,0,0)
+f(32,92,6,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',6,0,0)
+f(33,92,6,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',6,0,0)
+f(34,93,5,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',5,0,0)
+f(30,98,1,2,'zio/RuntimeFlags$.opSupervision',1,0,0)
+f(30,99,3,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(31,99,3,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(32,99,3,1,'zio/Unsafe$.unsafe')
+f(33,99,3,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d3f940.apply')
+f(34,99,3,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(35,99,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.apply')
+f(36,99,3,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1$$anonfun$1')
+f(37,99,3,1,'scala/math/BigInt.$plus')
+f(38,100,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(39,100,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(38,101,1,2,'scala/math/BigInt.longEncoding',1,0,0)
+f(30,102,2,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',2,0,0)
+f(31,103,1,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',1,0,0)
+f(32,103,1,2,'java/util/concurrent/ConcurrentLinkedQueue.first',1,0,0)
+f(30,104,393,1,'zio/internal/FiberRuntime.runLoop')
+f(31,115,24,1,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply',5,0,0)
+f(32,115,24,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',5,0,0)
+f(33,115,5,3,'itable stub')
+f(33,120,14,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(34,120,3,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',3,0,0)
+f(35,120,3,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',3,0,0)
+f(36,120,3,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',3,0,0)
+f(34,123,11,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(35,124,2,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',2,0,0)
+f(36,124,2,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',2,0,0)
+f(37,124,2,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',2,0,0)
+f(35,126,6,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(36,126,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(37,126,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(38,126,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(36,127,3,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(37,127,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(38,127,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(39,127,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(37,128,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(38,128,1,2,'zio/ZIO$.succeed',1,0,0)
+f(39,128,1,2,'zio/ZIOCompanionVersionSpecific.succeed$',1,0,0)
+f(40,128,1,2,'zio/ZIOCompanionVersionSpecific.succeed',1,0,0)
+f(41,128,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(42,128,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(43,128,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(37,129,1,1,'zio/ZIO$OnSuccess.flatMap')
+f(38,129,1,1,'zio/ZIO.flatMap$')
+f(39,129,1,1,'zio/ZIO.flatMap')
+f(40,129,1,1,'zio/ZIO$OnSuccess$.apply')
+f(41,129,1,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(42,129,1,4,'InstanceKlass::allocate_instance(JavaThread*)')
+f(43,129,1,4,'MemAllocator::allocate() const')
+f(44,129,1,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(45,129,1,4,'G1CollectedHeap::allocate_new_tlab(unsigned long, unsigned long, unsigned long*)')
+f(46,129,1,4,'G1CollectedHeap::attempt_allocation_slow(unsigned long)')
+f(47,129,1,4,'MutatorAllocRegion::retire(bool)')
+f(48,129,1,4,'G1MonitoringSupport::update_eden_size()')
+f(49,129,1,3,'pthread_mutex_lock')
+f(36,130,2,2,'zio/ZIO$.succeed',2,0,0)
+f(37,130,2,2,'zio/ZIOCompanionVersionSpecific.succeed$',2,0,0)
+f(38,130,2,2,'zio/ZIOCompanionVersionSpecific.succeed',2,0,0)
+f(39,130,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(40,130,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(41,130,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(39,131,1,2,'zio/ZIO$Sync$.apply',1,0,0)
+f(35,132,1,2,'zio/ZIO$.succeed',1,0,0)
+f(36,132,1,2,'zio/ZIOCompanionVersionSpecific.succeed$',1,0,0)
+f(37,132,1,2,'zio/ZIOCompanionVersionSpecific.succeed',1,0,0)
+f(38,132,1,2,'zio/ZIO$Sync$.apply',1,0,0)
+f(35,133,1,2,'zio/ZIO$OnSuccess.flatMap',1,0,0)
+f(36,133,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(37,133,1,2,'zio/ZIO.flatMap',1,0,0)
+f(38,133,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(33,134,3,1,'zio/ZIO$OnSuccess.flatMap')
+f(34,135,2,2,'zio/ZIO.flatMap$',2,0,0)
+f(35,135,2,2,'zio/ZIO.flatMap',2,0,0)
+f(36,135,2,2,'zio/ZIO$OnSuccess$.apply',2,0,0)
+f(37,135,2,2,'zio/ZIO$OnSuccess.<init>',2,0,0)
+f(33,137,2,1,'zio/ZIO$Sync.flatMap')
+f(34,138,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(35,138,1,2,'zio/ZIO.flatMap',1,0,0)
+f(36,138,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(31,139,9,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',9,0,0)
+f(32,139,9,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',9,0,0)
+f(33,139,9,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',9,0,0)
+f(34,139,9,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',9,0,0)
+f(35,140,7,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',7,0,0)
+f(35,147,1,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.<init>',1,0,0)
+f(31,148,1,2,'zio/RuntimeFlags$.opSupervision',1,0,0)
+f(31,149,2,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(32,149,2,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(33,149,2,1,'zio/Unsafe$.unsafe')
+f(34,149,2,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d3f940.apply')
+f(35,149,2,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(36,149,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.apply')
+f(37,149,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1$$anonfun$1')
+f(38,149,2,1,'scala/math/BigInt.$plus')
+f(39,150,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(31,151,8,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',8,0,0)
+f(32,153,6,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',6,0,0)
+f(33,155,4,2,'java/util/concurrent/ConcurrentLinkedQueue.first',4,0,0)
+f(31,159,338,1,'zio/internal/FiberRuntime.runLoop')
+f(32,178,41,2,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply',15,0,0)
+f(33,178,41,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',15,0,0)
+f(34,179,14,3,'itable stub')
+f(34,193,17,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(35,196,3,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',3,0,0)
+f(36,196,3,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',3,0,0)
+f(37,196,3,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',3,0,0)
+f(35,199,5,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(36,200,3,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(36,203,1,2,'zio/ZIO$Sync.flatMap',1,0,0)
+f(37,203,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(38,203,1,2,'zio/ZIO.flatMap',1,0,0)
+f(39,203,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(40,203,1,2,'zio/ZIO$OnSuccess.<init>',1,0,0)
+f(35,204,4,2,'zio/ZIO$.succeed',4,0,0)
+f(36,204,4,2,'zio/ZIOCompanionVersionSpecific.succeed$',4,0,0)
+f(37,204,4,2,'zio/ZIOCompanionVersionSpecific.succeed',4,0,0)
+f(38,204,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(39,204,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(40,204,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(38,205,3,2,'zio/ZIO$Sync$.apply',3,0,0)
+f(39,207,1,2,'zio/ZIO$Sync.<init>',1,0,0)
+f(35,208,1,2,'zio/ZIO$OnSuccess.flatMap',1,0,0)
+f(36,208,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(37,208,1,2,'zio/ZIO.flatMap',1,0,0)
+f(38,208,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(35,209,1,2,'zio/ZIO$Sync.flatMap',1,0,0)
+f(36,209,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(37,209,1,2,'zio/ZIO.flatMap',1,0,0)
+f(38,209,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(34,210,2,1,'zio/ZIO$OnSuccess.flatMap')
+f(35,210,2,2,'zio/ZIO.flatMap$',2,0,0)
+f(36,210,2,2,'zio/ZIO.flatMap',2,0,0)
+f(37,210,2,2,'zio/ZIO$OnSuccess$.apply',2,0,0)
+f(38,211,1,2,'zio/ZIO$OnSuccess.<init>',1,0,0)
+f(34,212,7,1,'zio/ZIO$Sync.flatMap')
+f(35,216,3,2,'zio/ZIO.flatMap$',3,0,0)
+f(36,216,3,2,'zio/ZIO.flatMap',3,0,0)
+f(37,216,3,2,'zio/ZIO$OnSuccess$.apply',3,0,0)
+f(38,218,1,2,'zio/ZIO$OnSuccess.<init>',1,0,0)
+f(32,219,16,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',16,0,0)
+f(33,221,14,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',14,0,0)
+f(34,222,12,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',12,0,0)
+f(35,222,12,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',12,0,0)
+f(36,223,11,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',11,0,0)
+f(34,234,1,2,'zio/ZIO$.succeed',1,0,0)
+f(32,235,2,2,'zio/RuntimeFlags$.opSupervision',2,0,0)
+f(32,237,5,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply',1,0,0)
+f(33,237,5,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1',1,0,0)
+f(34,237,5,1,'zio/Unsafe$.unsafe',1,0,0)
+f(35,237,5,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d3f940.apply',1,0,0)
+f(36,237,5,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1',1,0,0)
+f(37,237,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.apply',1,0,0)
+f(38,237,5,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1$$anonfun$1',1,0,0)
+f(39,238,4,1,'scala/math/BigInt.$plus')
+f(40,240,2,2,'scala/math/BigInt$.apply',2,0,0)
+f(41,241,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(32,242,9,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',9,0,0)
+f(33,244,7,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',7,0,0)
+f(34,246,5,2,'java/util/concurrent/ConcurrentLinkedQueue.first',5,0,0)
+f(32,251,246,1,'zio/internal/FiberRuntime.runLoop')
+f(33,269,41,2,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply',26,0,0)
+f(34,269,41,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',26,0,0)
+f(35,272,23,3,'itable stub')
+f(35,295,6,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(36,295,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(37,295,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(38,295,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(36,296,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(37,296,1,2,'zio/ZIO$.succeed',1,0,0)
+f(38,296,1,2,'zio/ZIOCompanionVersionSpecific.succeed$',1,0,0)
+f(39,296,1,2,'zio/ZIOCompanionVersionSpecific.succeed',1,0,0)
+f(40,296,1,2,'zio/ZIO$Sync$.apply',1,0,0)
+f(36,297,4,2,'zio/ZIO$.succeed',4,0,0)
+f(37,297,4,2,'zio/ZIOCompanionVersionSpecific.succeed$',4,0,0)
+f(38,297,4,2,'zio/ZIOCompanionVersionSpecific.succeed',4,0,0)
+f(39,298,3,2,'zio/ZIO$Sync$.apply',3,0,0)
+f(35,301,2,1,'zio/ZIO$OnSuccess.flatMap')
+f(36,302,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(37,302,1,2,'zio/ZIO.flatMap',1,0,0)
+f(38,302,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(35,303,7,1,'zio/ZIO$Sync.flatMap')
+f(36,305,5,2,'zio/ZIO.flatMap$',5,0,0)
+f(37,305,5,2,'zio/ZIO.flatMap',5,0,0)
+f(38,305,5,2,'zio/ZIO$OnSuccess$.apply',5,0,0)
+f(39,309,1,2,'zio/ZIO$OnSuccess.<init>',1,0,0)
+f(33,310,18,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',18,0,0)
+f(34,315,13,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',13,0,0)
+f(35,315,11,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',11,0,0)
+f(36,315,11,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',11,0,0)
+f(37,316,8,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',8,0,0)
+f(37,324,2,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.<init>',2,0,0)
+f(38,325,1,2,'java/lang/Object.<init>',1,0,0)
+f(35,326,2,2,'zio/ZIO$.succeed',2,0,0)
+f(36,326,2,2,'zio/ZIOCompanionVersionSpecific.succeed$',2,0,0)
+f(37,326,2,2,'zio/ZIOCompanionVersionSpecific.succeed',2,0,0)
+f(38,326,2,2,'zio/ZIO$Sync$.apply',2,0,0)
+f(39,326,2,2,'zio/ZIO$Sync.<init>',2,0,0)
+f(33,328,1,2,'zio/RuntimeFlags$.opSupervision',1,0,0)
+f(33,329,9,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(34,329,9,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(35,329,9,1,'zio/Unsafe$.unsafe')
+f(36,329,9,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d3f940.apply')
+f(37,329,9,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(38,329,9,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.apply')
+f(39,329,9,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1$$anonfun$1')
+f(40,329,9,1,'scala/math/BigInt.$plus')
+f(41,333,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(42,333,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(41,334,4,2,'scala/math/BigInt.longEncoding',4,0,0)
+f(42,337,1,2,'scala/math/BigInt._long',1,0,0)
+f(33,338,15,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',15,0,0)
+f(34,344,9,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',9,0,0)
+f(35,347,6,2,'java/util/concurrent/ConcurrentLinkedQueue.first',6,0,0)
+f(33,353,144,1,'zio/internal/FiberRuntime.runLoop')
+f(34,376,1,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(35,376,1,4,'InstanceKlass::allocate_instance(JavaThread*)')
+f(36,376,1,4,'MemAllocator::allocate() const')
+f(37,376,1,4,'AllocTracer::send_allocation_in_new_tlab(Klass*, HeapWordImpl**, unsigned long, unsigned long, JavaThread*)')
+f(38,376,1,4,'JfrObjectAllocationSample::send_event(Klass const*, unsigned long, bool, Thread*)')
+f(34,377,26,2,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply',11,0,0)
+f(35,377,26,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',11,0,0)
+f(36,377,11,3,'itable stub')
+f(36,388,9,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(37,389,3,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',3,0,0)
+f(38,389,3,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',3,0,0)
+f(39,389,3,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',3,0,0)
+f(37,392,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(38,392,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(39,392,1,2,'zio/ZIO$.succeed',1,0,0)
+f(40,392,1,2,'zio/ZIOCompanionVersionSpecific.succeed$',1,0,0)
+f(41,392,1,2,'zio/ZIOCompanionVersionSpecific.succeed',1,0,0)
+f(42,392,1,2,'zio/ZIO$Sync$.apply',1,0,0)
+f(37,393,3,2,'zio/ZIO$.succeed',3,0,0)
+f(38,393,3,2,'zio/ZIOCompanionVersionSpecific.succeed$',3,0,0)
+f(39,393,3,2,'zio/ZIOCompanionVersionSpecific.succeed',3,0,0)
+f(40,393,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(41,393,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(42,393,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(40,394,2,2,'zio/ZIO$Sync$.apply',2,0,0)
+f(41,395,1,2,'zio/ZIO$Sync.<init>',1,0,0)
+f(37,396,1,2,'zio/ZIO$Sync.flatMap',1,0,0)
+f(38,396,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(39,396,1,2,'zio/ZIO.flatMap',1,0,0)
+f(36,397,6,1,'zio/ZIO$Sync.flatMap')
+f(37,400,3,2,'zio/ZIO.flatMap$',3,0,0)
+f(38,400,3,2,'zio/ZIO.flatMap',3,0,0)
+f(39,400,3,2,'zio/ZIO$OnSuccess$.apply',3,0,0)
+f(40,402,1,2,'zio/ZIO$OnSuccess.<init>',1,0,0)
+f(34,403,14,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',14,0,0)
+f(35,408,9,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',9,0,0)
+f(36,410,7,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',7,0,0)
+f(37,410,7,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',7,0,0)
+f(38,411,5,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',5,0,0)
+f(38,416,1,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.<init>',1,0,0)
+f(39,416,1,2,'java/lang/Object.<init>',1,0,0)
+f(34,417,5,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(35,417,5,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(36,417,5,1,'zio/Unsafe$.unsafe')
+f(37,417,5,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d3f940.apply')
+f(38,417,5,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(39,417,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.apply')
+f(40,417,5,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1$$anonfun$1')
+f(41,417,5,1,'scala/math/BigInt.$plus')
+f(42,419,2,2,'scala/math/BigInt$.apply',2,0,0)
+f(43,420,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(42,421,1,2,'scala/math/BigInt.longEncoding',1,0,0)
+f(34,422,16,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',16,0,0)
+f(35,427,11,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',11,0,0)
+f(36,432,6,2,'java/util/concurrent/ConcurrentLinkedQueue.first',6,0,0)
+f(34,438,59,1,'zio/internal/FiberRuntime.runLoop')
+f(35,451,21,2,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply',10,0,0)
+f(36,451,21,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',10,0,0)
+f(37,451,10,3,'itable stub')
+f(37,461,4,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(38,462,3,2,'zio/ZIO$.succeed',3,0,0)
+f(39,462,3,2,'zio/ZIOCompanionVersionSpecific.succeed$',3,0,0)
+f(40,462,3,2,'zio/ZIOCompanionVersionSpecific.succeed',3,0,0)
+f(41,462,2,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',2,0,0)
+f(42,462,2,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',2,0,0)
+f(43,462,2,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',2,0,0)
+f(41,464,1,2,'zio/ZIO$Sync$.apply',1,0,0)
+f(37,465,7,1,'zio/ZIO$Sync.flatMap')
+f(38,467,5,2,'zio/ZIO.flatMap$',5,0,0)
+f(39,467,5,2,'zio/ZIO.flatMap',5,0,0)
+f(40,467,5,2,'zio/ZIO$OnSuccess$.apply',5,0,0)
+f(41,470,2,2,'zio/ZIO$OnSuccess.<init>',2,0,0)
+f(35,472,5,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',5,0,0)
+f(36,473,4,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',4,0,0)
+f(37,473,4,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',4,0,0)
+f(38,473,4,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',4,0,0)
+f(39,473,4,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',4,0,0)
+f(35,477,1,2,'zio/RuntimeFlags$.opSupervision',1,0,0)
+f(35,478,1,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(36,478,1,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(37,478,1,1,'zio/Unsafe$.unsafe')
+f(38,478,1,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d3f940.apply')
+f(39,478,1,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(40,478,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.apply')
+f(41,478,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1$$anonfun$1')
+f(42,478,1,1,'scala/math/BigInt.$plus')
+f(43,478,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(35,479,3,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',3,0,0)
+f(36,480,2,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',2,0,0)
+f(37,480,2,2,'java/util/concurrent/ConcurrentLinkedQueue.first',2,0,0)
+f(35,482,15,1,'zio/internal/FiberRuntime.runLoop')
+f(36,482,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply')
+f(37,482,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2')
+f(38,482,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(39,482,1,2,'zio/ZIO$.succeed',1,0,0)
+f(40,482,1,2,'zio/ZIOCompanionVersionSpecific.succeed$',1,0,0)
+f(41,482,1,2,'zio/ZIOCompanionVersionSpecific.succeed',1,0,0)
+f(42,482,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(43,482,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(44,482,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(38,483,1,1,'zio/ZIO$Sync.flatMap')
+f(36,484,5,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',5,0,0)
+f(37,484,5,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',5,0,0)
+f(38,484,4,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',4,0,0)
+f(39,484,4,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',4,0,0)
+f(40,486,2,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',2,0,0)
+f(38,488,1,2,'zio/ZIO$.succeed',1,0,0)
+f(36,489,1,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(37,489,1,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(38,489,1,1,'zio/Unsafe$.unsafe')
+f(39,489,1,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d3f940.apply')
+f(40,489,1,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(41,489,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d571d0.apply')
+f(42,489,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1$$anonfun$1')
+f(43,489,1,1,'scala/math/BigInt.$plus')
+f(36,490,2,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',2,0,0)
+f(37,491,1,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',1,0,0)
+f(38,491,1,2,'java/util/concurrent/ConcurrentLinkedQueue.first',1,0,0)
+f(36,492,5,1,'zio/internal/FiberRuntime.runLoop')
+f(37,494,1,2,'kyo/bench/BroadFlatMapBench$$Lambda$77.0x0000000800d20fd0.apply',1,0,0)
+f(38,494,1,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',1,0,0)
+f(39,494,1,3,'itable stub')
+f(37,495,2,2,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d56e00.apply',2,0,0)
+f(38,496,1,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',1,0,0)
+f(39,496,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(40,496,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(41,496,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+
+search();
+</script></body></html>
