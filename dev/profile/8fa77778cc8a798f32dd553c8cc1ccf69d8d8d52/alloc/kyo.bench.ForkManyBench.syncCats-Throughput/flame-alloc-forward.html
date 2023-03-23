@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 400px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>Allocation profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(25);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,51975,3,'all')
+f(1,0,50623,1,'cats/effect/unsafe/WorkerThread.run')
+f(2,0,50623,1,'cats/effect/IOFiber.run')
+f(3,0,2,1,'cats/effect/IOFiber.asyncContinueSuccessfulR')
+f(4,0,2,1,'cats/effect/IOFiber.succeeded')
+f(5,0,2,1,'cats/effect/IOFiber.runTerminusSuccessK')
+f(6,0,2,1,'cats/effect/IOFiber.done')
+f(7,0,2,1,'cats/effect/CallbackStack.apply')
+f(8,0,2,1,'scala/runtime/function/JProcedure1.apply')
+f(9,0,2,1,'scala/runtime/function/JProcedure1.apply')
+f(10,0,2,1,'cats/effect/IO$$Lambda$95.0x0000000800d5e7a0.applyVoid')
+f(11,0,2,1,'cats/effect/IO.$anonfun$6')
+f(12,0,2,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(13,0,2,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(14,0,2,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(15,0,2,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(16,0,1,2,'cats.effect.IO$$Lambda$112+0x0000000800d6f790')
+f(16,1,1,2,'cats.effect.IO$$Lambda$114+0x0000000800d71008')
+f(3,2,25313,1,'cats/effect/IOFiber.autoCedeR')
+f(4,2,25313,1,'cats/effect/IOFiber.runLoop')
+f(5,2,5294,2,'cats.effect.IOFiber')
+f(5,5296,2,1,'cats/effect/IO$$anon$3$$Lambda$121.0x0000000800d85240.apply')
+f(6,5296,2,1,'cats/effect/IO$$anon$3.apply$$anonfun$1$$anonfun$1')
+f(7,5296,1,1,'cats/FlatMap$ToFlatMapOps$$anon$2.flatMap')
+f(8,5296,1,1,'cats/FlatMap$Ops.flatMap$')
+f(9,5296,1,1,'cats/FlatMap$Ops.flatMap')
+f(10,5296,1,1,'cats/effect/IO$$anon$2.flatMap')
+f(11,5296,1,1,'cats/effect/IO$$anon$2.flatMap')
+f(12,5296,1,1,'cats/effect/IO.flatMap')
+f(13,5296,1,1,'cats/effect/IO$FlatMap$.apply')
+f(14,5296,1,2,'cats.effect.IO$FlatMap')
+f(7,5297,1,1,'cats/effect/kernel/Deferred$AsyncDeferred$$Lambda$117.0x0000000800d743a8.apply')
+f(8,5297,1,1,'cats/effect/kernel/Deferred$AsyncDeferred.get$$anonfun$1$$anonfun$1')
+f(9,5297,1,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(10,5297,1,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(11,5297,1,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(12,5297,1,2,'cats.effect.kernel.Deferred$AsyncDeferred$$Lambda$123+0x0000000800d85a18')
+f(5,5298,2,1,'cats/effect/IO$.apply')
+f(6,5298,2,1,'cats/effect/IO$.delay')
+f(7,5298,2,1,'cats/effect/IO$Delay$.apply')
+f(8,5298,2,2,'cats.effect.IO$Delay')
+f(5,5300,14187,1,'cats/effect/IOFiber.<init>')
+f(6,5300,4142,1,'cats/effect/ArrayStack$.apply')
+f(7,5300,4142,2,'cats.effect.ArrayStack')
+f(6,9442,1809,1,'cats/effect/CallbackStack$.apply')
+f(7,9442,1809,2,'cats.effect.CallbackStack')
+f(6,11251,3459,1,'cats/effect/IO$.async')
+f(7,11251,1535,2,'cats.effect.IO$$anon$3')
+f(7,12786,1924,1,'cats/effect/IO$IOCont$.apply')
+f(8,12786,1924,2,'cats.effect.IO$IOCont')
+f(6,14710,1809,1,'cats/effect/IO$.uncancelable')
+f(7,14710,1809,1,'cats/effect/IO$Uncancelable$.apply')
+f(8,14710,1809,2,'cats.effect.IO$Uncancelable')
+f(6,16519,2968,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(7,16519,2968,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(8,16519,2968,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(9,16519,1582,2,'cats.effect.IOFiber$$Lambda$96+0x0000000800d5d000')
+f(9,18101,1386,2,'cats.effect.IOFiber$$Lambda$97+0x0000000800d5d3d0')
+f(5,19487,20,1,'cats/effect/IOFiber.scheduleFiber')
+f(6,19487,20,1,'cats/effect/unsafe/WorkStealingThreadPool.execute')
+f(7,19487,20,1,'cats/effect/unsafe/WorkerThread.schedule')
+f(8,19487,20,1,'cats/effect/unsafe/LocalQueue.enqueue')
+f(9,19487,3,1,'cats/effect/unsafe/ScalQueue.offerAll')
+f(10,19487,3,1,'java/util/concurrent/ConcurrentLinkedQueue.offer')
+f(11,19487,3,2,'java.util.concurrent.ConcurrentLinkedQueue$Node')
+f(9,19490,2,2,'java.lang.Runnable[][]')
+f(9,19492,15,2,'java.lang.Runnable[]')
+f(5,19507,5806,1,'cats/effect/IOFiber.succeeded')
+f(6,19507,5806,1,'kyo/bench/ForkManyBench$$Lambda$104.0x0000000800d682c0.apply')
+f(7,19507,5806,1,'kyo/bench/ForkManyBench.repeat$1$$anonfun$1')
+f(8,19507,5806,1,'kyo/bench/ForkManyBench.repeat$1')
+f(9,19507,3730,1,'cats/effect/IO.flatMap')
+f(10,19507,3730,1,'cats/effect/IO$FlatMap$.apply')
+f(11,19507,3730,2,'cats.effect.IO$FlatMap')
+f(9,23237,2076,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(10,23237,2076,1,'java/lang/invoke/LambdaForm$DMH.0x0000000800d6c400.newInvokeSpecial')
+f(11,23237,2076,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(12,23237,2076,2,'kyo.bench.ForkManyBench$$Lambda$104+0x0000000800d682c0')
+f(5,25313,2,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(6,25313,2,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(7,25313,2,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(8,25313,2,2,'cats.effect.IOFiber$$Lambda$118+0x0000000800d74b98')
+f(3,25315,25308,1,'cats/effect/IOFiber.execR')
+f(4,25315,14628,1,'cats/effect/ArrayStack.init')
+f(5,25315,14628,2,'java.lang.Object[]')
+f(4,39943,2825,1,'cats/effect/ByteStack$.create')
+f(5,39943,2825,2,'int[]')
+f(4,42768,7855,1,'cats/effect/IOFiber.runLoop')
+f(5,42768,1,2,'cats.effect.IOFiber$$anon$1')
+f(5,42769,244,2,'cats.effect.IOFiber')
+f(5,43013,1,1,'cats/effect/IO$$$Lambda$99.0x0000000800d66a58.apply')
+f(6,43013,1,1,'cats/effect/IO$.ref$$anonfun$1')
+f(7,43013,1,1,'cats/effect/kernel/Ref$.unsafe')
+f(8,43013,1,2,'cats.effect.kernel.SyncRef')
+f(5,43014,616,1,'cats/effect/IOFiber.<init>')
+f(6,43014,165,1,'cats/effect/ArrayStack$.apply')
+f(7,43014,165,2,'cats.effect.ArrayStack')
+f(6,43179,84,1,'cats/effect/CallbackStack$.apply')
+f(7,43179,84,2,'cats.effect.CallbackStack')
+f(6,43263,158,1,'cats/effect/IO$.async')
+f(7,43263,67,2,'cats.effect.IO$$anon$3')
+f(7,43330,91,1,'cats/effect/IO$IOCont$.apply')
+f(8,43330,91,2,'cats.effect.IO$IOCont')
+f(6,43421,92,1,'cats/effect/IO$.uncancelable')
+f(7,43421,92,1,'cats/effect/IO$Uncancelable$.apply')
+f(8,43421,92,2,'cats.effect.IO$Uncancelable')
+f(6,43513,117,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(7,43513,117,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(8,43513,117,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(9,43513,61,2,'cats.effect.IOFiber$$Lambda$96+0x0000000800d5d000')
+f(9,43574,56,2,'cats.effect.IOFiber$$Lambda$97+0x0000000800d5d3d0')
+f(5,43630,3644,1,'cats/effect/IOFiber.succeeded')
+f(6,43630,3433,1,'cats/effect/IOFiber.runTerminusSuccessK')
+f(7,43630,870,1,'cats/effect/IO$.pure')
+f(8,43630,870,1,'cats/effect/IO$Pure$.apply')
+f(9,43630,870,2,'cats.effect.IO$Pure')
+f(7,44500,1549,1,'cats/effect/IOFiber.done')
+f(8,44500,1549,1,'cats/effect/IO$.pure')
+f(9,44500,1549,1,'cats/effect/IO$Pure$.apply')
+f(10,44500,1549,2,'cats.effect.IO$Pure')
+f(7,46049,1014,1,'cats/effect/kernel/Outcome$Succeeded$.apply')
+f(8,46049,1014,2,'cats.effect.kernel.Outcome$Succeeded')
+f(6,47063,4,1,'kyo/bench/ForkManyBench$$Lambda$101.0x0000000800d67308.apply')
+f(7,47063,4,1,'kyo/bench/ForkManyBench.catsBench$$anonfun$1$$anonfun$2')
+f(8,47063,1,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(9,47063,1,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(10,47063,1,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(11,47063,1,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(12,47063,1,2,'kyo.bench.ForkManyBench$$Lambda$105+0x0000000800d68690')
+f(8,47064,3,1,'kyo/bench/ForkManyBench.repeat$1')
+f(9,47064,1,1,'cats/effect/IO.flatMap')
+f(10,47064,1,1,'cats/effect/IO$FlatMap$.apply')
+f(11,47064,1,2,'cats.effect.IO$FlatMap')
+f(9,47065,2,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(10,47065,2,1,'java/lang/invoke/LambdaForm$DMH.0x0000000800d6c400.newInvokeSpecial')
+f(11,47065,2,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(12,47065,2,2,'kyo.bench.ForkManyBench$$Lambda$104+0x0000000800d682c0')
+f(6,47067,207,1,'kyo/bench/ForkManyBench$$Lambda$104.0x0000000800d682c0.apply')
+f(7,47067,207,1,'kyo/bench/ForkManyBench.repeat$1$$anonfun$1')
+f(8,47067,207,1,'kyo/bench/ForkManyBench.repeat$1')
+f(9,47067,123,1,'cats/effect/IO.flatMap')
+f(10,47067,123,1,'cats/effect/IO$FlatMap$.apply')
+f(11,47067,123,2,'cats.effect.IO$FlatMap')
+f(9,47190,84,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(10,47190,84,1,'java/lang/invoke/LambdaForm$DMH.0x0000000800d6c400.newInvokeSpecial')
+f(11,47190,84,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(12,47190,84,2,'kyo.bench.ForkManyBench$$Lambda$104+0x0000000800d682c0')
+f(5,47274,4,1,'cats/effect/kernel/Deferred$AsyncDeferred$$Lambda$108.0x0000000800d6a040.apply')
+f(6,47274,4,1,'cats/effect/kernel/Deferred$AsyncDeferred.complete$$anonfun$1$$anonfun$1')
+f(7,47274,4,1,'cats/effect/kernel/Deferred$AsyncDeferred.loop$3')
+f(8,47274,4,1,'cats/effect/kernel/Deferred$AsyncDeferred.notifyReaders$1')
+f(9,47274,1,1,'cats/syntax/FlatMapOps$.$greater$greater$extension')
+f(10,47274,1,1,'cats/effect/IO$$anon$2.flatMap')
+f(11,47274,1,1,'cats/effect/IO$$anon$2.flatMap')
+f(12,47274,1,1,'cats/effect/IO.flatMap')
+f(13,47274,1,1,'cats/effect/IO$FlatMap$.apply')
+f(14,47274,1,2,'cats.effect.IO$FlatMap')
+f(9,47275,3,1,'scala/collection/immutable/LongMap.valuesIterator')
+f(10,47275,3,1,'scala/collection/immutable/LongMapValueIterator.<init>')
+f(11,47275,3,1,'scala/collection/immutable/LongMapIterator.<init>')
+f(12,47275,3,2,'java.lang.Object[]')
+f(5,47278,3337,1,'cats/effect/kernel/SyncRef$$Lambda$103.0x0000000800d68000.apply')
+f(6,47278,3337,1,'cats/effect/kernel/SyncRef.modify$$anonfun$1')
+f(7,47278,3337,1,'cats/effect/kernel/SyncRef.spin$4')
+f(8,47278,3337,1,'kyo/bench/ForkManyBench$$Lambda$102.0x0000000800d67980.apply')
+f(9,47278,3337,1,'kyo/bench/ForkManyBench.$anonfun$adapted$1')
+f(10,47278,3337,1,'kyo/bench/ForkManyBench.$anonfun$1')
+f(11,47278,2,1,'cats/effect/kernel/Deferred$AsyncDeferred.complete')
+f(12,47278,1,1,'cats/effect/IO$$anon$2.uncancelable')
+f(13,47278,1,1,'cats/effect/IO$$anon$2.uncancelable')
+f(14,47278,1,1,'cats/effect/IO$.uncancelable')
+f(15,47278,1,1,'cats/effect/IO$Uncancelable$.apply')
+f(16,47278,1,2,'cats.effect.IO$Uncancelable')
+f(12,47279,1,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(13,47279,1,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(14,47279,1,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(15,47279,1,2,'cats.effect.kernel.Deferred$AsyncDeferred$$Lambda$107+0x0000000800d69500')
+f(11,47280,2310,1,'scala/Tuple2$.apply')
+f(12,47280,2310,2,'scala.Tuple2')
+f(11,49590,1025,1,'scala/runtime/BoxesRunTime.boxToInteger')
+f(12,49590,1025,1,'java/lang/Integer.valueOf')
+f(13,49590,1025,2,'java.lang.Integer')
+f(5,50615,8,1,'kyo/bench/ForkManyBench$$Lambda$100.0x0000000800d66d18.apply')
+f(6,50615,8,1,'kyo/bench/ForkManyBench.catsBench$$anonfun$1$$anonfun$1')
+f(7,50615,4,1,'cats/effect/IO.flatten')
+f(8,50615,4,1,'cats/effect/IO.flatMap')
+f(9,50615,4,1,'cats/effect/IO$FlatMap$.apply')
+f(10,50615,4,2,'cats.effect.IO$FlatMap')
+f(7,50619,1,1,'cats/effect/kernel/SyncRef.modify')
+f(8,50619,1,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(9,50619,1,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(10,50619,1,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(11,50619,1,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(12,50619,1,2,'cats.effect.kernel.SyncRef$$Lambda$103+0x0000000800d68000')
+f(7,50620,2,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(8,50620,2,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(9,50620,2,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(10,50620,1,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(11,50620,1,2,'kyo.bench.ForkManyBench$$Lambda$102+0x0000000800d67980')
+f(10,50621,1,2,'kyo.bench.ForkManyBench$$Lambda$102+0x0000000800d67980')
+f(7,50622,1,1,'scala/Tuple2$.apply')
+f(8,50622,1,2,'scala.Tuple2')
+f(1,50623,1344,1,'java/lang/Thread.run')
+f(2,50623,1344,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(3,50623,1344,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(4,50623,1344,1,'java/util/concurrent/FutureTask.run')
+f(5,50623,1344,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(6,50623,1344,1,'java/util/concurrent/FutureTask.run')
+f(7,50623,1344,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(8,50623,1344,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(9,50623,1344,1,'java/lang/reflect/Method.invoke')
+f(10,50623,1344,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(11,50623,1344,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(12,50623,1344,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(13,50623,1344,1,'kyo/bench/jmh_generated/ForkManyBench_syncCats_jmhTest.syncCats_Throughput')
+f(14,50623,1344,1,'kyo/bench/jmh_generated/ForkManyBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(15,50623,1343,1,'kyo/bench/Bench.syncCats')
+f(16,50623,1213,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(17,50623,1150,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(18,50623,625,1,'cats/effect/IO.unsafeRunAsync')
+f(19,50623,550,1,'cats/effect/IO.unsafeRunFiber')
+f(20,50623,100,2,'cats.effect.IOFiber')
+f(20,50723,46,5,'cats.effect.IOFiber')
+f(20,50769,311,1,'cats/effect/IOFiber.<init>')
+f(21,50769,105,1,'cats/effect/ArrayStack$.apply')
+f(22,50769,105,2,'cats.effect.ArrayStack')
+f(21,50874,54,1,'cats/effect/CallbackStack$.apply')
+f(22,50874,54,2,'cats.effect.CallbackStack')
+f(21,50928,79,1,'cats/effect/IO$.async')
+f(22,50928,28,2,'cats.effect.IO$$anon$3')
+f(22,50956,51,1,'cats/effect/IO$IOCont$.apply')
+f(23,50956,51,2,'cats.effect.IO$IOCont')
+f(21,51007,33,1,'cats/effect/IO$.uncancelable')
+f(22,51007,33,1,'cats/effect/IO$Uncancelable$.apply')
+f(23,51007,33,2,'cats.effect.IO$Uncancelable')
+f(21,51040,40,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(22,51040,40,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(23,51040,40,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(24,51040,31,2,'cats.effect.IOFiber$$Lambda$96+0x0000000800d5d000')
+f(24,51071,9,2,'cats.effect.IOFiber$$Lambda$97+0x0000000800d5d3d0')
+f(20,51080,47,1,'cats/effect/unsafe/WorkStealingThreadPool.execute')
+f(21,51080,47,1,'cats/effect/unsafe/WorkStealingThreadPool.scheduleExternal')
+f(22,51080,47,1,'cats/effect/unsafe/ScalQueue.offer')
+f(23,51080,47,1,'java/util/concurrent/ConcurrentLinkedQueue.offer')
+f(24,51080,47,2,'java.util.concurrent.ConcurrentLinkedQueue$Node')
+f(20,51127,46,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(21,51127,46,1,'java/lang/invoke/LambdaForm$DMH.0x0000000800d5cc00.newInvokeSpecial')
+f(22,51127,46,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(23,51127,36,2,'cats.effect.IO$$Lambda$95+0x0000000800d5e7a0')
+f(23,51163,10,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(24,51163,10,2,'cats.effect.IO$$Lambda$95+0x0000000800d5e7a0')
+f(19,51173,75,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(20,51173,75,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(21,51173,75,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(22,51173,8,2,'cats.effect.IO$$Lambda$92+0x0000000800d5af50')
+f(22,51181,19,2,'cats.effect.IO$$Lambda$93+0x0000000800d5b210')
+f(22,51200,17,2,'cats.effect.IO$$Lambda$94+0x0000000800d5b618')
+f(22,51217,31,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(23,51217,31,2,'cats.effect.IO$$Lambda$93+0x0000000800d5b210')
+f(18,51248,70,2,'java.util.concurrent.ArrayBlockingQueue')
+f(18,51318,72,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(19,51318,72,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(20,51318,72,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(21,51318,22,2,'cats.effect.IOPlatform$$Lambda$91+0x0000000800d5ab48')
+f(21,51340,33,2,'cats.effect.IOPlatform$$Lambda$98+0x0000000800d60000')
+f(21,51373,17,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(22,51373,1,2,'cats.effect.IOPlatform$$Lambda$91+0x0000000800d5ab48')
+f(22,51374,16,2,'cats.effect.IOPlatform$$Lambda$98+0x0000000800d60000')
+f(18,51390,188,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(19,51390,188,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(20,51390,41,2,'java.lang.Object[]')
+f(20,51431,35,2,'java.util.concurrent.locks.ReentrantLock')
+f(20,51466,26,1,'java/util/concurrent/locks/ReentrantLock.<init>')
+f(21,51466,26,2,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(20,51492,86,1,'java/util/concurrent/locks/ReentrantLock.newCondition')
+f(21,51492,86,1,'java/util/concurrent/locks/ReentrantLock$Sync.newCondition')
+f(22,51492,86,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject')
+f(18,51578,85,1,'scala/concurrent/package$.blocking')
+f(19,51578,85,1,'scala/concurrent/BlockContext$DefaultBlockContext$.blockOn')
+f(20,51578,85,1,'cats/effect/IOPlatform$$Lambda$98.0x0000000800d60000.apply')
+f(21,51578,85,1,'cats/effect/IOPlatform.$anonfun$1')
+f(22,51578,85,1,'java/util/concurrent/ArrayBlockingQueue.poll')
+f(23,51578,85,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject.awaitNanos')
+f(24,51578,85,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionNode')
+f(18,51663,110,1,'scala/util/Either.fold')
+f(19,51663,110,1,'cats/effect/IOPlatform$$Lambda$116.0x0000000800d72bd8.apply')
+f(20,51663,110,1,'cats/effect/IOPlatform.unsafeRunTimed$$anonfun$3')
+f(21,51663,110,1,'scala/Some$.apply')
+f(22,51663,110,2,'scala.Some')
+f(17,51773,10,2,'scala.concurrent.duration.package$DurationLong')
+f(17,51783,53,1,'scala/concurrent/duration/package$DurationLong.nanos')
+f(18,51783,53,1,'scala/concurrent/duration/DurationConversions.nanos$')
+f(19,51783,53,1,'scala/concurrent/duration/DurationConversions.nanos')
+f(20,51783,53,1,'scala/concurrent/duration/package$DurationLong.nanoseconds')
+f(21,51783,53,1,'scala/concurrent/duration/DurationConversions.nanoseconds$')
+f(22,51783,53,1,'scala/concurrent/duration/DurationConversions.nanoseconds')
+f(23,51783,53,1,'scala/concurrent/duration/package$DurationLong.durationIn')
+f(24,51783,53,2,'scala.concurrent.duration.FiniteDuration')
+f(16,51836,130,1,'kyo/bench/ForkManyBench.catsBench')
+f(17,51836,98,1,'cats/effect/IO$.deferred')
+f(18,51836,61,1,'cats/effect/IO$.apply')
+f(19,51836,61,1,'cats/effect/IO$.delay')
+f(20,51836,61,1,'cats/effect/IO$Delay$.apply')
+f(21,51836,61,2,'cats.effect.IO$Delay')
+f(18,51897,37,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(19,51897,37,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(20,51897,37,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(21,51897,35,2,'cats.effect.IO$$$Lambda$38+0x0000000800c8cac8')
+f(21,51932,2,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(22,51932,2,2,'cats.effect.IO$$$Lambda$38+0x0000000800c8cac8')
+f(17,51934,32,1,'cats/effect/IO.flatMap')
+f(18,51934,32,1,'cats/effect/IO$FlatMap$.apply')
+f(19,51934,32,2,'cats.effect.IO$FlatMap')
+f(15,51966,1,1,'org/openjdk/jmh/infra/Blackhole.consume')
+f(16,51966,1,2,'java.lang.String')
+f(1,51967,8,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(2,51967,8,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(3,51967,8,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(4,51967,8,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(5,51967,8,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(6,51967,8,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(7,51967,7,1,'org/openjdk/jmh/runner/BenchmarkHandler.runIteration')
+f(8,51967,1,2,'org.openjdk.jmh.infra.Control')
+f(8,51968,1,2,'org.openjdk.jmh.runner.InfraControl')
+f(8,51969,5,1,'org/openjdk/jmh/runner/InfraControl.awaitWarmdownReady')
+f(9,51969,5,1,'org/openjdk/jmh/runner/InfraControlL2.awaitWarmdownReady')
+f(10,51969,5,1,'java/util/concurrent/CountDownLatch.await')
+f(11,51969,5,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireSharedInterruptibly')
+f(12,51969,5,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(13,51969,5,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode')
+f(7,51974,1,1,'org/openjdk/jmh/runner/ForkedRunner$1.accept')
+f(8,51974,1,1,'org/openjdk/jmh/runner/link/BinaryLinkClient.pushResults')
+f(9,51974,1,1,'java/lang/ClassLoader.loadClass')
+f(10,51974,1,1,'jdk/internal/loader/ClassLoaders$AppClassLoader.loadClass')
+f(11,51974,1,1,'jdk/internal/loader/BuiltinClassLoader.loadClass')
+f(12,51974,1,1,'jdk/internal/loader/BuiltinClassLoader.loadClassOrNull')
+f(13,51974,1,1,'jdk/internal/loader/BuiltinClassLoader.findClassOnClassPathOrNull')
+f(14,51974,1,1,'jdk/internal/loader/URLClassPath.getResource')
+f(15,51974,1,1,'jdk/internal/loader/URLClassPath$JarLoader.getResource')
+f(16,51974,1,1,'java/util/jar/JarFile.getJarEntry')
+f(17,51974,1,1,'java/util/jar/JarFile.getEntry')
+f(18,51974,1,1,'java/util/zip/ZipFile.getEntry')
+f(19,51974,1,1,'java/util/zip/ZipFile$Source.getEntryPos')
+f(20,51974,1,1,'java/util/zip/ZipCoder$UTF8ZipCoder.toString')
+f(21,51974,1,1,'java/lang/System$2.newStringUTF8NoRepl')
+f(22,51974,1,1,'java/lang/String.newStringUTF8NoRepl')
+f(23,51974,1,1,'java/util/Arrays.copyOfRange')
+f(24,51974,1,2,'byte[]')
+
+search();
+</script></body></html>

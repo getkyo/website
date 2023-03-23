@@ -1,0 +1,1110 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 672px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>Allocation profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = true;
+	const levels = Array(42);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,19763,3,'all')
+f(1,0,20,2,'java.lang.ref.WeakReference')
+f(2,0,20,1,'zio/internal/WeakConcurrentBag.graduate')
+f(3,0,20,1,'zio/internal/ZScheduler$$anon$3.run')
+f(1,20,1,2,'java.util.HashMap$Node[]')
+f(2,20,1,1,'java/util/HashMap.resize')
+f(3,20,1,1,'java/util/HashMap.putVal')
+f(4,20,1,1,'java/util/HashMap.put')
+f(5,20,1,1,'java/util/HashSet.add')
+f(6,20,1,1,'java/io/ObjectStreamClass$FieldReflector.<init>')
+f(7,20,1,1,'java/io/ObjectStreamClass.getReflector')
+f(8,20,1,1,'java/io/ObjectStreamClass.<init>')
+f(9,20,1,1,'java/io/ObjectStreamClass.lookup')
+f(10,20,1,1,'java/io/ObjectOutputStream.writeObject0')
+f(11,20,1,1,'java/io/ObjectOutputStream.writeObject')
+f(12,20,1,1,'org/openjdk/jmh/runner/link/BinaryLinkClient.pushFrame')
+f(13,20,1,1,'org/openjdk/jmh/runner/link/BinaryLinkClient.pushResults')
+f(14,20,1,1,'org/openjdk/jmh/runner/ForkedRunner$1.accept')
+f(15,20,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(16,20,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(17,20,1,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(18,20,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(19,20,1,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(20,20,1,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(1,21,3,2,'java.util.concurrent.atomic.AtomicInteger')
+f(2,21,3,1,'org/openjdk/jmh/runner/InfraControlL2.<init>')
+f(3,21,3,1,'org/openjdk/jmh/runner/InfraControlL3.<init>')
+f(4,21,3,1,'org/openjdk/jmh/runner/InfraControlL4.<init>')
+f(5,21,3,1,'org/openjdk/jmh/runner/InfraControl.<init>')
+f(6,21,3,1,'org/openjdk/jmh/runner/BenchmarkHandler.runIteration')
+f(7,21,3,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(8,21,3,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(9,21,3,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(10,21,3,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(11,21,3,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(12,21,3,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(1,24,5,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode')
+f(2,24,5,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(3,24,5,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireSharedInterruptibly')
+f(4,24,5,1,'java/util/concurrent/CountDownLatch.await')
+f(5,24,5,1,'org/openjdk/jmh/runner/InfraControlL2.awaitWarmdownReady')
+f(6,24,5,1,'org/openjdk/jmh/runner/InfraControl.awaitWarmdownReady')
+f(7,24,5,1,'org/openjdk/jmh/runner/BenchmarkHandler.runIteration')
+f(8,24,5,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(9,24,5,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(10,24,5,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(11,24,5,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(12,24,5,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(13,24,5,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(1,29,1253,2,'kyo.bench.EnqueueDequeueBench$$Lambda$108+0x0000000800d683d0')
+f(2,29,1253,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,29,1253,1,'java/lang/invoke/LambdaForm$DMH.0x0000000800d6c400.newInvokeSpecial')
+f(4,29,1253,1,'java/lang/invoke/LambdaForm$MH.0x0000000800d6cc00.linkToTargetMethod')
+f(5,29,1253,1,'kyo/bench/EnqueueDequeueBench.loop$3')
+f(6,29,1253,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1$$anonfun$1')
+f(7,29,1253,1,'kyo/bench/EnqueueDequeueBench$$Lambda$111.0x0000000800d68f38.apply')
+f(8,29,1253,1,'zio/internal/FiberRuntime.runLoop')
+f(9,29,1253,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(10,29,665,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(11,29,665,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(12,29,665,1,'zio/internal/FiberRuntime.run')
+f(13,29,665,1,'zio/internal/ZScheduler$$anon$4.run')
+f(10,694,588,1,'zio/internal/FiberRuntime.start')
+f(11,694,588,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(12,694,588,1,'zio/Runtime$UnsafeAPIV1.run')
+f(13,694,588,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(14,694,588,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(15,694,588,1,'zio/Unsafe$.unsafe')
+f(16,694,588,1,'kyo/bench/Bench.syncZio')
+f(17,694,588,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(18,694,588,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(19,694,588,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(20,694,588,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(21,694,588,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(22,694,588,1,'java/lang/reflect/Method.invoke')
+f(23,694,588,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(24,694,588,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(25,694,588,1,'java/util/concurrent/FutureTask.run')
+f(26,694,588,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(27,694,588,1,'java/util/concurrent/FutureTask.run')
+f(28,694,588,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(29,694,588,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(30,694,588,1,'java/lang/Thread.run')
+f(1,1282,926,2,'kyo.bench.EnqueueDequeueBench$$Lambda$111+0x0000000800d68f38')
+f(2,1282,926,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,1282,926,1,'java/lang/invoke/LambdaForm$DMH.0x0000000800d6c400.newInvokeSpecial')
+f(4,1282,926,1,'java/lang/invoke/LambdaForm$MH.0x0000000800d6cc00.linkToTargetMethod')
+f(5,1282,926,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1')
+f(6,1282,926,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$adapted$1')
+f(7,1282,926,1,'kyo/bench/EnqueueDequeueBench$$Lambda$108.0x0000000800d683d0.apply')
+f(8,1282,926,1,'zio/internal/FiberRuntime.runLoop')
+f(9,1282,926,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(10,1282,574,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(11,1282,574,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(12,1282,574,1,'zio/internal/FiberRuntime.run')
+f(13,1282,574,1,'zio/internal/ZScheduler$$anon$4.run')
+f(10,1856,352,1,'zio/internal/FiberRuntime.start')
+f(11,1856,352,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(12,1856,352,1,'zio/Runtime$UnsafeAPIV1.run')
+f(13,1856,352,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(14,1856,352,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(15,1856,352,1,'zio/Unsafe$.unsafe')
+f(16,1856,352,1,'kyo/bench/Bench.syncZio')
+f(17,1856,352,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(18,1856,352,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(19,1856,352,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(20,1856,352,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(21,1856,352,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(22,1856,352,1,'java/lang/reflect/Method.invoke')
+f(23,1856,352,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(24,1856,352,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(25,1856,352,1,'java/util/concurrent/FutureTask.run')
+f(26,1856,352,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(27,1856,352,1,'java/util/concurrent/FutureTask.run')
+f(28,1856,352,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(29,1856,352,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(30,1856,352,1,'java/lang/Thread.run')
+f(1,2208,3,5,'org.openjdk.jmh.runner.InfraControl')
+f(2,2208,3,1,'org/openjdk/jmh/runner/BenchmarkHandler.runIteration')
+f(3,2208,3,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(4,2208,3,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(5,2208,3,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(6,2208,3,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(7,2208,3,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(8,2208,3,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(1,2211,822,2,'zio.Cause$$anon$10')
+f(2,2211,822,1,'zio/Cause.interruptors')
+f(3,2211,822,1,'zio/ZIO$.descriptorWith$$anonfun$1')
+f(4,2211,822,1,'zio/ZIO$$$Lambda$99.0x0000000800d5f8e0.apply')
+f(5,2211,822,1,'zio/internal/FiberRuntime.runLoop')
+f(6,2211,822,1,'zio/internal/FiberRuntime.runLoop')
+f(7,2211,822,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(8,2211,301,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(9,2211,301,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(10,2211,301,1,'zio/internal/FiberRuntime.run')
+f(11,2211,301,1,'zio/internal/ZScheduler$$anon$4.run')
+f(8,2512,521,1,'zio/internal/FiberRuntime.start')
+f(9,2512,521,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(10,2512,521,1,'zio/Runtime$UnsafeAPIV1.run')
+f(11,2512,521,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(12,2512,521,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(13,2512,521,1,'zio/Unsafe$.unsafe')
+f(14,2512,521,1,'kyo/bench/Bench.syncZio')
+f(15,2512,521,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(16,2512,521,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(17,2512,521,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(18,2512,521,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(19,2512,521,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(20,2512,521,1,'java/lang/reflect/Method.invoke')
+f(21,2512,521,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(22,2512,521,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(23,2512,521,1,'java/util/concurrent/FutureTask.run')
+f(24,2512,521,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(25,2512,521,1,'java/util/concurrent/FutureTask.run')
+f(26,2512,521,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(27,2512,521,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(28,2512,521,1,'java/lang/Thread.run')
+f(1,3033,38,2,'zio.Exit$$Lambda$116+0x0000000800d72bb8')
+f(2,3033,38,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(3,3033,38,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(4,3033,38,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(5,3033,38,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(6,3033,38,1,'zio/Exit.getOrThrow')
+f(7,3033,38,1,'zio/Exit.getOrThrow$')
+f(8,3033,38,1,'zio/Exit$Success.getOrThrow')
+f(9,3033,38,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(10,3033,38,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(11,3033,38,1,'zio/Unsafe$.unsafe')
+f(12,3033,38,1,'kyo/bench/Bench.syncZio')
+f(13,3033,38,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(14,3033,38,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(15,3033,38,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(16,3033,38,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(17,3033,38,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(18,3033,38,1,'java/lang/reflect/Method.invoke')
+f(19,3033,38,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(20,3033,38,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(21,3033,38,1,'java/util/concurrent/FutureTask.run')
+f(22,3033,38,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(23,3033,38,1,'java/util/concurrent/FutureTask.run')
+f(24,3033,38,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(25,3033,38,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(26,3033,38,1,'java/lang/Thread.run')
+f(1,3071,1185,2,'zio.Fiber$Status$Running')
+f(2,3071,1185,1,'zio/Fiber$Status$Running$.apply')
+f(3,3071,1185,1,'zio/internal/FiberRuntime.runLoop')
+f(4,3071,1185,1,'zio/internal/FiberRuntime.runLoop')
+f(5,3071,1185,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(6,3071,573,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(7,3071,573,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(8,3071,573,1,'zio/internal/FiberRuntime.run')
+f(9,3071,573,1,'zio/internal/ZScheduler$$anon$4.run')
+f(6,3644,612,1,'zio/internal/FiberRuntime.start')
+f(7,3644,612,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(8,3644,612,1,'zio/Runtime$UnsafeAPIV1.run')
+f(9,3644,612,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(10,3644,612,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(11,3644,612,1,'zio/Unsafe$.unsafe')
+f(12,3644,612,1,'kyo/bench/Bench.syncZio')
+f(13,3644,612,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(14,3644,612,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(15,3644,612,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(16,3644,612,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(17,3644,612,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(18,3644,612,1,'java/lang/reflect/Method.invoke')
+f(19,3644,612,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(20,3644,612,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(21,3644,612,1,'java/util/concurrent/FutureTask.run')
+f(22,3644,612,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(23,3644,612,1,'java/util/concurrent/FutureTask.run')
+f(24,3644,612,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(25,3644,612,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(26,3644,612,1,'java/lang/Thread.run')
+f(1,4256,920,2,'zio.Queue$$anon$1$$Lambda$106+0x0000000800d67ae0')
+f(2,4256,892,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,4256,892,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,4256,892,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,4256,892,1,'zio/Queue$$anon$1.offer')
+f(6,4256,892,1,'kyo/bench/EnqueueDequeueBench.loop$3')
+f(7,4256,892,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1$$anonfun$1')
+f(8,4256,892,1,'kyo/bench/EnqueueDequeueBench$$Lambda$111.0x0000000800d68f38.apply')
+f(9,4256,892,1,'zio/internal/FiberRuntime.runLoop')
+f(10,4256,892,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(11,4256,328,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(12,4256,328,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(13,4256,328,1,'zio/internal/FiberRuntime.run')
+f(14,4256,328,1,'zio/internal/ZScheduler$$anon$4.run')
+f(11,4584,564,1,'zio/internal/FiberRuntime.start')
+f(12,4584,564,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(13,4584,564,1,'zio/Runtime$UnsafeAPIV1.run')
+f(14,4584,564,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(15,4584,564,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(16,4584,564,1,'zio/Unsafe$.unsafe')
+f(17,4584,564,1,'kyo/bench/Bench.syncZio')
+f(18,4584,564,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(19,4584,564,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(20,4584,564,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(21,4584,564,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(22,4584,564,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(23,4584,564,1,'java/lang/reflect/Method.invoke')
+f(24,4584,564,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(25,4584,564,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,4584,564,1,'java/util/concurrent/FutureTask.run')
+f(27,4584,564,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(28,4584,564,1,'java/util/concurrent/FutureTask.run')
+f(29,4584,564,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(30,4584,564,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(31,4584,564,1,'java/lang/Thread.run')
+f(2,5148,28,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(3,5148,28,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(4,5148,28,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(5,5148,28,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(6,5148,28,1,'zio/Queue$$anon$1.offer')
+f(7,5148,28,1,'kyo/bench/EnqueueDequeueBench.loop$3')
+f(8,5148,28,1,'kyo/bench/EnqueueDequeueBench.zioBench$$anonfun$2')
+f(9,5148,28,1,'kyo/bench/EnqueueDequeueBench$$Lambda$79.0x0000000800d1d000.apply')
+f(10,5148,28,1,'zio/internal/FiberRuntime.runLoop')
+f(11,5148,28,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(12,5148,28,1,'zio/internal/FiberRuntime.start')
+f(13,5148,28,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(14,5148,28,1,'zio/Runtime$UnsafeAPIV1.run')
+f(15,5148,28,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(16,5148,28,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(17,5148,28,1,'zio/Unsafe$.unsafe')
+f(18,5148,28,1,'kyo/bench/Bench.syncZio')
+f(19,5148,28,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(20,5148,28,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(21,5148,28,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(22,5148,28,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(23,5148,28,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(24,5148,28,1,'java/lang/reflect/Method.invoke')
+f(25,5148,28,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,5148,28,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,5148,28,1,'java/util/concurrent/FutureTask.run')
+f(28,5148,28,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(29,5148,28,1,'java/util/concurrent/FutureTask.run')
+f(30,5148,28,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(31,5148,28,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(32,5148,28,1,'java/lang/Thread.run')
+f(1,5176,1358,2,'zio.Queue$$anon$1$$Lambda$110+0x0000000800d68b68')
+f(2,5176,1358,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,5176,1358,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,5176,1358,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,5176,1358,1,'zio/Queue$$anon$1.take')
+f(6,5176,1358,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1')
+f(7,5176,1358,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$adapted$1')
+f(8,5176,1358,1,'kyo/bench/EnqueueDequeueBench$$Lambda$108.0x0000000800d683d0.apply')
+f(9,5176,1358,1,'zio/internal/FiberRuntime.runLoop')
+f(10,5176,1358,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(11,5176,755,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(12,5176,755,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(13,5176,755,1,'zio/internal/FiberRuntime.run')
+f(14,5176,755,1,'zio/internal/ZScheduler$$anon$4.run')
+f(11,5931,603,1,'zio/internal/FiberRuntime.start')
+f(12,5931,603,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(13,5931,603,1,'zio/Runtime$UnsafeAPIV1.run')
+f(14,5931,603,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(15,5931,603,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(16,5931,603,1,'zio/Unsafe$.unsafe')
+f(17,5931,603,1,'kyo/bench/Bench.syncZio')
+f(18,5931,603,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(19,5931,603,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(20,5931,603,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(21,5931,603,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(22,5931,603,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(23,5931,603,1,'java/lang/reflect/Method.invoke')
+f(24,5931,603,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(25,5931,603,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,5931,603,1,'java/util/concurrent/FutureTask.run')
+f(27,5931,603,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(28,5931,603,1,'java/util/concurrent/FutureTask.run')
+f(29,5931,603,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(30,5931,603,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(31,5931,603,1,'java/lang/Thread.run')
+f(1,6534,635,2,'zio.Queue$$anon$1$$Lambda$112+0x0000000800d69308')
+f(2,6534,635,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,6534,635,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,6534,635,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,6534,635,1,'zio/Queue$$anon$1.take$$anonfun$1')
+f(6,6534,635,1,'zio/Queue$$anon$1$$Lambda$110.0x0000000800d68b68.apply')
+f(7,6534,635,1,'zio/ZIO$.fiberIdWith$$anonfun$1')
+f(8,6534,635,1,'zio/ZIO$$$Lambda$98.0x0000000800d5f050.apply')
+f(9,6534,635,1,'zio/ZIO$.descriptorWith$$anonfun$1')
+f(10,6534,635,1,'zio/ZIO$$$Lambda$99.0x0000000800d5f8e0.apply')
+f(11,6534,635,1,'zio/internal/FiberRuntime.runLoop')
+f(12,6534,635,1,'zio/internal/FiberRuntime.runLoop')
+f(13,6534,635,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(14,6534,296,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(15,6534,296,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(16,6534,296,1,'zio/internal/FiberRuntime.run')
+f(17,6534,296,1,'zio/internal/ZScheduler$$anon$4.run')
+f(14,6830,339,1,'zio/internal/FiberRuntime.start')
+f(15,6830,339,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(16,6830,339,1,'zio/Runtime$UnsafeAPIV1.run')
+f(17,6830,339,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(18,6830,339,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(19,6830,339,1,'zio/Unsafe$.unsafe')
+f(20,6830,339,1,'kyo/bench/Bench.syncZio')
+f(21,6830,339,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(22,6830,339,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(23,6830,339,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(24,6830,339,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(25,6830,339,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(26,6830,339,1,'java/lang/reflect/Method.invoke')
+f(27,6830,339,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(28,6830,339,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(29,6830,339,1,'java/util/concurrent/FutureTask.run')
+f(30,6830,339,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(31,6830,339,1,'java/util/concurrent/FutureTask.run')
+f(32,6830,339,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(33,6830,339,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(34,6830,339,1,'java/lang/Thread.run')
+f(1,7169,7,2,'zio.Runtime$UnsafeAPIV1$$Lambda$114+0x0000000800d70f08')
+f(2,7169,7,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(3,7169,7,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(4,7169,7,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(5,7169,7,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(6,7169,7,1,'zio/Runtime$UnsafeAPIV1.run')
+f(7,7169,7,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(8,7169,7,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(9,7169,7,1,'zio/Unsafe$.unsafe')
+f(10,7169,7,1,'kyo/bench/Bench.syncZio')
+f(11,7169,7,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(12,7169,7,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(13,7169,7,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,7169,7,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,7169,7,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,7169,7,1,'java/lang/reflect/Method.invoke')
+f(17,7169,7,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,7169,7,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,7169,7,1,'java/util/concurrent/FutureTask.run')
+f(20,7169,7,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,7169,7,1,'java/util/concurrent/FutureTask.run')
+f(22,7169,7,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,7169,7,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,7169,7,1,'java/lang/Thread.run')
+f(1,7176,936,2,'zio.ZIO$$$Lambda$107+0x0000000800d68000')
+f(2,7176,936,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,7176,936,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,7176,936,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,7176,936,1,'zio/ZIO$.suspendSucceed')
+f(6,7176,936,1,'zio/Queue$$anon$1.offer')
+f(7,7176,936,1,'kyo/bench/EnqueueDequeueBench.loop$3')
+f(8,7176,936,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1$$anonfun$1')
+f(9,7176,936,1,'kyo/bench/EnqueueDequeueBench$$Lambda$111.0x0000000800d68f38.apply')
+f(10,7176,936,1,'zio/internal/FiberRuntime.runLoop')
+f(11,7176,936,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(12,7176,564,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(13,7176,564,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(14,7176,564,1,'zio/internal/FiberRuntime.run')
+f(15,7176,564,1,'zio/internal/ZScheduler$$anon$4.run')
+f(12,7740,372,1,'zio/internal/FiberRuntime.start')
+f(13,7740,372,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(14,7740,372,1,'zio/Runtime$UnsafeAPIV1.run')
+f(15,7740,372,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(16,7740,372,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(17,7740,372,1,'zio/Unsafe$.unsafe')
+f(18,7740,372,1,'kyo/bench/Bench.syncZio')
+f(19,7740,372,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(20,7740,372,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(21,7740,372,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(22,7740,372,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(23,7740,372,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(24,7740,372,1,'java/lang/reflect/Method.invoke')
+f(25,7740,372,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,7740,372,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,7740,372,1,'java/util/concurrent/FutureTask.run')
+f(28,7740,372,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(29,7740,372,1,'java/util/concurrent/FutureTask.run')
+f(30,7740,372,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(31,7740,372,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(32,7740,372,1,'java/lang/Thread.run')
+f(1,8112,1260,2,'zio.ZIO$$$Lambda$98+0x0000000800d5f050')
+f(2,8112,1260,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,8112,1260,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,8112,1260,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,8112,1260,1,'zio/ZIO$.fiberIdWith')
+f(6,8112,1260,1,'zio/Queue$$anon$1.take')
+f(7,8112,1260,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1')
+f(8,8112,1260,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$adapted$1')
+f(9,8112,1260,1,'kyo/bench/EnqueueDequeueBench$$Lambda$108.0x0000000800d683d0.apply')
+f(10,8112,1260,1,'zio/internal/FiberRuntime.runLoop')
+f(11,8112,1260,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(12,8112,640,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(13,8112,640,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(14,8112,640,1,'zio/internal/FiberRuntime.run')
+f(15,8112,640,1,'zio/internal/ZScheduler$$anon$4.run')
+f(12,8752,620,1,'zio/internal/FiberRuntime.start')
+f(13,8752,620,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(14,8752,620,1,'zio/Runtime$UnsafeAPIV1.run')
+f(15,8752,620,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(16,8752,620,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(17,8752,620,1,'zio/Unsafe$.unsafe')
+f(18,8752,620,1,'kyo/bench/Bench.syncZio')
+f(19,8752,620,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(20,8752,620,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(21,8752,620,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(22,8752,620,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(23,8752,620,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(24,8752,620,1,'java/lang/reflect/Method.invoke')
+f(25,8752,620,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,8752,620,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,8752,620,1,'java/util/concurrent/FutureTask.run')
+f(28,8752,620,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(29,8752,620,1,'java/util/concurrent/FutureTask.run')
+f(30,8752,620,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(31,8752,620,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(32,8752,620,1,'java/lang/Thread.run')
+f(1,9372,1259,2,'zio.ZIO$$$Lambda$99+0x0000000800d5f8e0')
+f(2,9372,1259,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,9372,1259,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,9372,1259,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,9372,1259,1,'zio/ZIO$.descriptorWith')
+f(6,9372,1259,1,'zio/ZIO$.fiberIdWith')
+f(7,9372,1259,1,'zio/Queue$$anon$1.take')
+f(8,9372,1259,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1')
+f(9,9372,1259,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$adapted$1')
+f(10,9372,1259,1,'kyo/bench/EnqueueDequeueBench$$Lambda$108.0x0000000800d683d0.apply')
+f(11,9372,1259,1,'zio/internal/FiberRuntime.runLoop')
+f(12,9372,1259,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(13,9372,632,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(14,9372,632,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(15,9372,632,1,'zio/internal/FiberRuntime.run')
+f(16,9372,632,1,'zio/internal/ZScheduler$$anon$4.run')
+f(13,10004,627,1,'zio/internal/FiberRuntime.start')
+f(14,10004,627,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(15,10004,627,1,'zio/Runtime$UnsafeAPIV1.run')
+f(16,10004,627,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(17,10004,627,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(18,10004,627,1,'zio/Unsafe$.unsafe')
+f(19,10004,627,1,'kyo/bench/Bench.syncZio')
+f(20,10004,627,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(21,10004,627,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(22,10004,627,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(23,10004,627,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(24,10004,627,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(25,10004,627,1,'java/lang/reflect/Method.invoke')
+f(26,10004,627,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,10004,627,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(28,10004,627,1,'java/util/concurrent/FutureTask.run')
+f(29,10004,627,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(30,10004,627,1,'java/util/concurrent/FutureTask.run')
+f(31,10004,627,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(32,10004,627,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(33,10004,627,1,'java/lang/Thread.run')
+f(1,10631,38,2,'zio.ZIO$EvaluationStep[]')
+f(2,10631,38,1,'java/lang/reflect/Array.newInstance')
+f(3,10631,38,1,'scala/reflect/ClassTag$GenericClassTag.newArray')
+f(4,10631,38,1,'scala/runtime/Arrays$.newGenericArray')
+f(5,10631,38,1,'zio/internal/PinchableArray.ensurePinchCapacity')
+f(6,10631,38,1,'zio/internal/PinchableArray.pinch')
+f(7,10631,38,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(8,10631,38,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(9,10631,38,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(10,10631,38,1,'zio/internal/FiberRuntime.run')
+f(11,10631,38,1,'zio/internal/ZScheduler$$anon$4.run')
+f(1,10669,2996,2,'zio.ZIO$OnSuccess')
+f(2,10669,2996,1,'zio/ZIO$OnSuccess$.apply')
+f(3,10669,2996,1,'zio/ZIO.flatMap')
+f(4,10669,2996,1,'zio/ZIO.flatMap$')
+f(5,10669,1153,1,'zio/ZIO$OnSuccess.flatMap')
+f(6,10669,1153,1,'kyo/bench/EnqueueDequeueBench.loop$3')
+f(7,10669,1153,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1$$anonfun$1')
+f(8,10669,1153,1,'kyo/bench/EnqueueDequeueBench$$Lambda$111.0x0000000800d68f38.apply')
+f(9,10669,1153,1,'zio/internal/FiberRuntime.runLoop')
+f(10,10669,1153,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(11,10669,509,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(12,10669,509,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(13,10669,509,1,'zio/internal/FiberRuntime.run')
+f(14,10669,509,1,'zio/internal/ZScheduler$$anon$4.run')
+f(11,11178,644,1,'zio/internal/FiberRuntime.start')
+f(12,11178,644,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(13,11178,644,1,'zio/Runtime$UnsafeAPIV1.run')
+f(14,11178,644,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(15,11178,644,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(16,11178,644,1,'zio/Unsafe$.unsafe')
+f(17,11178,644,1,'kyo/bench/Bench.syncZio')
+f(18,11178,644,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(19,11178,644,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(20,11178,644,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(21,11178,644,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(22,11178,644,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(23,11178,644,1,'java/lang/reflect/Method.invoke')
+f(24,11178,644,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(25,11178,644,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,11178,644,1,'java/util/concurrent/FutureTask.run')
+f(27,11178,644,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(28,11178,644,1,'java/util/concurrent/FutureTask.run')
+f(29,11178,644,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(30,11178,644,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(31,11178,644,1,'java/lang/Thread.run')
+f(5,11822,894,1,'zio/ZIO$Stateful.flatMap')
+f(6,11822,894,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1')
+f(7,11822,894,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$adapted$1')
+f(8,11822,894,1,'kyo/bench/EnqueueDequeueBench$$Lambda$108.0x0000000800d683d0.apply')
+f(9,11822,894,1,'zio/internal/FiberRuntime.runLoop')
+f(10,11822,894,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(11,11822,503,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(12,11822,503,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(13,11822,503,1,'zio/internal/FiberRuntime.run')
+f(14,11822,503,1,'zio/internal/ZScheduler$$anon$4.run')
+f(11,12325,391,1,'zio/internal/FiberRuntime.start')
+f(12,12325,391,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(13,12325,391,1,'zio/Runtime$UnsafeAPIV1.run')
+f(14,12325,391,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(15,12325,391,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(16,12325,391,1,'zio/Unsafe$.unsafe')
+f(17,12325,391,1,'kyo/bench/Bench.syncZio')
+f(18,12325,391,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(19,12325,391,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(20,12325,391,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(21,12325,391,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(22,12325,391,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(23,12325,391,1,'java/lang/reflect/Method.invoke')
+f(24,12325,391,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(25,12325,391,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,12325,391,1,'java/util/concurrent/FutureTask.run')
+f(27,12325,391,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(28,12325,391,1,'java/util/concurrent/FutureTask.run')
+f(29,12325,391,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(30,12325,391,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(31,12325,391,1,'java/lang/Thread.run')
+f(5,12716,949,1,'zio/ZIO$Sync.flatMap')
+f(6,12716,949,1,'zio/ZIO$.suspendSucceed')
+f(7,12716,949,1,'zio/Queue$$anon$1.offer')
+f(8,12716,949,1,'kyo/bench/EnqueueDequeueBench.loop$3')
+f(9,12716,949,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1$$anonfun$1')
+f(10,12716,949,1,'kyo/bench/EnqueueDequeueBench$$Lambda$111.0x0000000800d68f38.apply')
+f(11,12716,949,1,'zio/internal/FiberRuntime.runLoop')
+f(12,12716,949,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(13,12716,453,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(14,12716,453,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(15,12716,453,1,'zio/internal/FiberRuntime.run')
+f(16,12716,453,1,'zio/internal/ZScheduler$$anon$4.run')
+f(13,13169,496,1,'zio/internal/FiberRuntime.start')
+f(14,13169,496,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(15,13169,496,1,'zio/Runtime$UnsafeAPIV1.run')
+f(16,13169,496,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(17,13169,496,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(18,13169,496,1,'zio/Unsafe$.unsafe')
+f(19,13169,496,1,'kyo/bench/Bench.syncZio')
+f(20,13169,496,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(21,13169,496,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(22,13169,496,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(23,13169,496,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(24,13169,496,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(25,13169,496,1,'java/lang/reflect/Method.invoke')
+f(26,13169,496,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,13169,496,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(28,13169,496,1,'java/util/concurrent/FutureTask.run')
+f(29,13169,496,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(30,13169,496,1,'java/util/concurrent/FutureTask.run')
+f(31,13169,496,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(32,13169,496,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(33,13169,496,1,'java/lang/Thread.run')
+f(1,13665,1399,2,'zio.ZIO$Stateful')
+f(2,13665,1399,1,'zio/ZIO$Stateful$.apply')
+f(3,13665,1399,1,'zio/ZIO$.withFiberRuntime')
+f(4,13665,1399,1,'zio/ZIO$.descriptorWith')
+f(5,13665,1399,1,'zio/ZIO$.fiberIdWith')
+f(6,13665,1399,1,'zio/Queue$$anon$1.take')
+f(7,13665,1399,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1')
+f(8,13665,1399,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$adapted$1')
+f(9,13665,1399,1,'kyo/bench/EnqueueDequeueBench$$Lambda$108.0x0000000800d683d0.apply')
+f(10,13665,1399,1,'zio/internal/FiberRuntime.runLoop')
+f(11,13665,1399,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(12,13665,632,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(13,13665,632,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(14,13665,632,1,'zio/internal/FiberRuntime.run')
+f(15,13665,632,1,'zio/internal/ZScheduler$$anon$4.run')
+f(12,14297,767,1,'zio/internal/FiberRuntime.start')
+f(13,14297,767,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(14,14297,767,1,'zio/Runtime$UnsafeAPIV1.run')
+f(15,14297,767,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(16,14297,767,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(17,14297,767,1,'zio/Unsafe$.unsafe')
+f(18,14297,767,1,'kyo/bench/Bench.syncZio')
+f(19,14297,767,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(20,14297,767,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(21,14297,767,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(22,14297,767,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(23,14297,767,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(24,14297,767,1,'java/lang/reflect/Method.invoke')
+f(25,14297,767,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,14297,767,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,14297,767,1,'java/util/concurrent/FutureTask.run')
+f(28,14297,767,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(29,14297,767,1,'java/util/concurrent/FutureTask.run')
+f(30,14297,767,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(31,14297,767,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(32,14297,767,1,'java/lang/Thread.run')
+f(1,15064,2869,2,'zio.ZIO$Sync')
+f(2,15064,2869,1,'zio/ZIO$Sync$.apply')
+f(3,15064,2869,1,'zio/ZIOCompanionVersionSpecific.succeed')
+f(4,15064,2869,1,'zio/ZIOCompanionVersionSpecific.succeed$')
+f(5,15064,2869,1,'zio/ZIO$.succeed')
+f(6,15064,854,1,'zio/Queue$$anon$1.offer$$anonfun$1')
+f(7,15064,854,1,'zio/Queue$$anon$1$$Lambda$106.0x0000000800d67ae0.apply')
+f(8,15064,854,1,'zio/ZIO$.suspendSucceed$$anonfun$1')
+f(9,15064,854,1,'zio/ZIO$$$Lambda$107.0x0000000800d68000.apply')
+f(10,15064,854,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(11,15064,854,1,'zio/UnsafeVersionSpecific$$Lambda$95.0x0000000800d56e38.apply')
+f(12,15064,854,1,'zio/Unsafe$.unsafe')
+f(13,15064,854,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(14,15064,854,1,'zio/ZIOCompanionVersionSpecific$$Lambda$70.0x0000000800d12ed8.apply')
+f(15,15064,854,1,'zio/internal/FiberRuntime.runLoop')
+f(16,15064,854,1,'zio/internal/FiberRuntime.runLoop')
+f(17,15064,854,1,'zio/internal/FiberRuntime.runLoop')
+f(18,15064,854,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(19,15064,414,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(20,15064,414,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(21,15064,414,1,'zio/internal/FiberRuntime.run')
+f(22,15064,414,1,'zio/internal/ZScheduler$$anon$4.run')
+f(19,15478,440,1,'zio/internal/FiberRuntime.start')
+f(20,15478,440,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(21,15478,440,1,'zio/Runtime$UnsafeAPIV1.run')
+f(22,15478,440,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(23,15478,440,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(24,15478,440,1,'zio/Unsafe$.unsafe')
+f(25,15478,440,1,'kyo/bench/Bench.syncZio')
+f(26,15478,440,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(27,15478,440,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(28,15478,440,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(29,15478,440,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(30,15478,440,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(31,15478,440,1,'java/lang/reflect/Method.invoke')
+f(32,15478,440,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(33,15478,440,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(34,15478,440,1,'java/util/concurrent/FutureTask.run')
+f(35,15478,440,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(36,15478,440,1,'java/util/concurrent/FutureTask.run')
+f(37,15478,440,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(38,15478,440,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(39,15478,440,1,'java/lang/Thread.run')
+f(6,15918,967,1,'zio/Queue$$anon$1.take$$anonfun$1')
+f(7,15918,967,1,'zio/Queue$$anon$1$$Lambda$110.0x0000000800d68b68.apply')
+f(8,15918,967,1,'zio/ZIO$.fiberIdWith$$anonfun$1')
+f(9,15918,967,1,'zio/ZIO$$$Lambda$98.0x0000000800d5f050.apply')
+f(10,15918,967,1,'zio/ZIO$.descriptorWith$$anonfun$1')
+f(11,15918,967,1,'zio/ZIO$$$Lambda$99.0x0000000800d5f8e0.apply')
+f(12,15918,967,1,'zio/internal/FiberRuntime.runLoop')
+f(13,15918,967,1,'zio/internal/FiberRuntime.runLoop')
+f(14,15918,967,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(15,15918,350,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(16,15918,350,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(17,15918,350,1,'zio/internal/FiberRuntime.run')
+f(18,15918,350,1,'zio/internal/ZScheduler$$anon$4.run')
+f(15,16268,617,1,'zio/internal/FiberRuntime.start')
+f(16,16268,617,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(17,16268,617,1,'zio/Runtime$UnsafeAPIV1.run')
+f(18,16268,617,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(19,16268,617,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(20,16268,617,1,'zio/Unsafe$.unsafe')
+f(21,16268,617,1,'kyo/bench/Bench.syncZio')
+f(22,16268,617,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(23,16268,617,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(24,16268,617,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(25,16268,617,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(26,16268,617,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(27,16268,617,1,'java/lang/reflect/Method.invoke')
+f(28,16268,617,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(29,16268,617,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(30,16268,617,1,'java/util/concurrent/FutureTask.run')
+f(31,16268,617,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(32,16268,617,1,'java/util/concurrent/FutureTask.run')
+f(33,16268,617,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(34,16268,617,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(35,16268,617,1,'java/lang/Thread.run')
+f(6,16885,1048,1,'zio/ZIO$.suspendSucceed')
+f(7,16885,1048,1,'zio/Queue$$anon$1.offer')
+f(8,16885,1048,1,'kyo/bench/EnqueueDequeueBench.loop$3')
+f(9,16885,1048,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1$$anonfun$1')
+f(10,16885,1048,1,'kyo/bench/EnqueueDequeueBench$$Lambda$111.0x0000000800d68f38.apply')
+f(11,16885,1048,1,'zio/internal/FiberRuntime.runLoop')
+f(12,16885,1048,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(13,16885,448,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(14,16885,448,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(15,16885,448,1,'zio/internal/FiberRuntime.run')
+f(16,16885,448,1,'zio/internal/ZScheduler$$anon$4.run')
+f(13,17333,600,1,'zio/internal/FiberRuntime.start')
+f(14,17333,600,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(15,17333,600,1,'zio/Runtime$UnsafeAPIV1.run')
+f(16,17333,600,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(17,17333,600,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(18,17333,600,1,'zio/Unsafe$.unsafe')
+f(19,17333,600,1,'kyo/bench/Bench.syncZio')
+f(20,17333,600,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(21,17333,600,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(22,17333,600,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(23,17333,600,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(24,17333,600,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(25,17333,600,1,'java/lang/reflect/Method.invoke')
+f(26,17333,600,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,17333,600,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(28,17333,600,1,'java/util/concurrent/FutureTask.run')
+f(29,17333,600,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(30,17333,600,1,'java/util/concurrent/FutureTask.run')
+f(31,17333,600,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(32,17333,600,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(33,17333,600,1,'java/lang/Thread.run')
+f(1,17933,1823,2,'zio.ZIOCompanionVersionSpecific$$Lambda$70+0x0000000800d12ed8')
+f(2,17933,1823,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,17933,1823,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,17933,1823,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,17933,1823,1,'zio/ZIOCompanionVersionSpecific.succeed')
+f(6,17933,1823,1,'zio/ZIOCompanionVersionSpecific.succeed$')
+f(7,17933,1823,1,'zio/ZIO$.succeed')
+f(8,17933,540,1,'zio/Queue$$anon$1.offer$$anonfun$1')
+f(9,17933,540,1,'zio/Queue$$anon$1$$Lambda$106.0x0000000800d67ae0.apply')
+f(10,17933,540,1,'zio/ZIO$.suspendSucceed$$anonfun$1')
+f(11,17933,540,1,'zio/ZIO$$$Lambda$107.0x0000000800d68000.apply')
+f(12,17933,540,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(13,17933,540,1,'zio/UnsafeVersionSpecific$$Lambda$95.0x0000000800d56e38.apply')
+f(14,17933,540,1,'zio/Unsafe$.unsafe')
+f(15,17933,540,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(16,17933,540,1,'zio/ZIOCompanionVersionSpecific$$Lambda$70.0x0000000800d12ed8.apply')
+f(17,17933,540,1,'zio/internal/FiberRuntime.runLoop')
+f(18,17933,540,1,'zio/internal/FiberRuntime.runLoop')
+f(19,17933,540,1,'zio/internal/FiberRuntime.runLoop')
+f(20,17933,540,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(21,17933,261,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(22,17933,261,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(23,17933,261,1,'zio/internal/FiberRuntime.run')
+f(24,17933,261,1,'zio/internal/ZScheduler$$anon$4.run')
+f(21,18194,279,1,'zio/internal/FiberRuntime.start')
+f(22,18194,279,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(23,18194,279,1,'zio/Runtime$UnsafeAPIV1.run')
+f(24,18194,279,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(25,18194,279,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(26,18194,279,1,'zio/Unsafe$.unsafe')
+f(27,18194,279,1,'kyo/bench/Bench.syncZio')
+f(28,18194,279,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(29,18194,279,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(30,18194,279,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(31,18194,279,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(32,18194,279,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(33,18194,279,1,'java/lang/reflect/Method.invoke')
+f(34,18194,279,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(35,18194,279,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(36,18194,279,1,'java/util/concurrent/FutureTask.run')
+f(37,18194,279,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(38,18194,279,1,'java/util/concurrent/FutureTask.run')
+f(39,18194,279,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(40,18194,279,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(41,18194,279,1,'java/lang/Thread.run')
+f(8,18473,643,1,'zio/Queue$$anon$1.take$$anonfun$1')
+f(9,18473,643,1,'zio/Queue$$anon$1$$Lambda$110.0x0000000800d68b68.apply')
+f(10,18473,643,1,'zio/ZIO$.fiberIdWith$$anonfun$1')
+f(11,18473,643,1,'zio/ZIO$$$Lambda$98.0x0000000800d5f050.apply')
+f(12,18473,643,1,'zio/ZIO$.descriptorWith$$anonfun$1')
+f(13,18473,643,1,'zio/ZIO$$$Lambda$99.0x0000000800d5f8e0.apply')
+f(14,18473,643,1,'zio/internal/FiberRuntime.runLoop')
+f(15,18473,643,1,'zio/internal/FiberRuntime.runLoop')
+f(16,18473,643,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(17,18473,384,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(18,18473,384,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(19,18473,384,1,'zio/internal/FiberRuntime.run')
+f(20,18473,384,1,'zio/internal/ZScheduler$$anon$4.run')
+f(17,18857,259,1,'zio/internal/FiberRuntime.start')
+f(18,18857,259,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(19,18857,259,1,'zio/Runtime$UnsafeAPIV1.run')
+f(20,18857,259,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(21,18857,259,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(22,18857,259,1,'zio/Unsafe$.unsafe')
+f(23,18857,259,1,'kyo/bench/Bench.syncZio')
+f(24,18857,259,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(25,18857,259,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(26,18857,259,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(27,18857,259,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(28,18857,259,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(29,18857,259,1,'java/lang/reflect/Method.invoke')
+f(30,18857,259,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(31,18857,259,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(32,18857,259,1,'java/util/concurrent/FutureTask.run')
+f(33,18857,259,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(34,18857,259,1,'java/util/concurrent/FutureTask.run')
+f(35,18857,259,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(36,18857,259,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(37,18857,259,1,'java/lang/Thread.run')
+f(8,19116,640,1,'zio/ZIO$.suspendSucceed')
+f(9,19116,640,1,'zio/Queue$$anon$1.offer')
+f(10,19116,640,1,'kyo/bench/EnqueueDequeueBench.loop$3')
+f(11,19116,640,1,'kyo/bench/EnqueueDequeueBench.loop$3$$anonfun$1$$anonfun$1')
+f(12,19116,640,1,'kyo/bench/EnqueueDequeueBench$$Lambda$111.0x0000000800d68f38.apply')
+f(13,19116,640,1,'zio/internal/FiberRuntime.runLoop')
+f(14,19116,640,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(15,19116,313,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(16,19116,313,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(17,19116,313,1,'zio/internal/FiberRuntime.run')
+f(18,19116,313,1,'zio/internal/ZScheduler$$anon$4.run')
+f(15,19429,327,1,'zio/internal/FiberRuntime.start')
+f(16,19429,327,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(17,19429,327,1,'zio/Runtime$UnsafeAPIV1.run')
+f(18,19429,327,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(19,19429,327,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(20,19429,327,1,'zio/Unsafe$.unsafe')
+f(21,19429,327,1,'kyo/bench/Bench.syncZio')
+f(22,19429,327,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(23,19429,327,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(24,19429,327,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(25,19429,327,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(26,19429,327,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(27,19429,327,1,'java/lang/reflect/Method.invoke')
+f(28,19429,327,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(29,19429,327,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(30,19429,327,1,'java/util/concurrent/FutureTask.run')
+f(31,19429,327,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(32,19429,327,1,'java/util/concurrent/FutureTask.run')
+f(33,19429,327,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(34,19429,327,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(35,19429,327,1,'java/lang/Thread.run')
+f(1,19756,7,2,'zio.internal.FiberRuntime')
+f(2,19756,7,1,'zio/internal/FiberRuntime$.apply')
+f(3,19756,7,1,'zio/Runtime$UnsafeAPIV1.runOrFork')
+f(4,19756,7,1,'zio/Runtime$UnsafeAPIV1.run')
+f(5,19756,7,1,'kyo/bench/Bench.syncZio$$anonfun$1')
+f(6,19756,7,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2e248.apply')
+f(7,19756,7,1,'zio/Unsafe$.unsafe')
+f(8,19756,7,1,'kyo/bench/Bench.syncZio')
+f(9,19756,7,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_thrpt_jmhStub')
+f(10,19756,7,1,'kyo/bench/jmh_generated/EnqueueDequeueBench_syncZio_jmhTest.syncZio_Throughput')
+f(11,19756,7,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(12,19756,7,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(13,19756,7,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(14,19756,7,1,'java/lang/reflect/Method.invoke')
+f(15,19756,7,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,19756,7,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,19756,7,1,'java/util/concurrent/FutureTask.run')
+f(18,19756,7,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(19,19756,7,1,'java/util/concurrent/FutureTask.run')
+f(20,19756,7,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(21,19756,7,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(22,19756,7,1,'java/lang/Thread.run')
+
+search();
+</script></body></html>

@@ -1,0 +1,1044 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 560px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>Allocation profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = true;
+	const levels = Array(35);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,65688,3,'all')
+f(1,0,538,2,'cats.effect.ArrayStack')
+f(2,0,538,1,'cats/effect/ArrayStack$.apply')
+f(3,0,538,1,'cats/effect/IOFiber.<init>')
+f(4,0,538,1,'cats/effect/IO.unsafeRunFiber')
+f(5,0,538,1,'cats/effect/IO.unsafeRunAsync')
+f(6,0,538,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(7,0,538,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(8,0,538,1,'kyo/bench/Bench.syncCats')
+f(9,0,538,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(10,0,538,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(11,0,538,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(12,0,538,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(13,0,538,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(14,0,538,1,'java/lang/reflect/Method.invoke')
+f(15,0,538,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,0,538,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,0,538,1,'java/util/concurrent/FutureTask.run')
+f(18,0,538,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(19,0,538,1,'java/util/concurrent/FutureTask.run')
+f(20,0,538,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(21,0,538,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(22,0,538,1,'java/lang/Thread.run')
+f(1,538,345,2,'cats.effect.CallbackStack')
+f(2,538,345,1,'cats/effect/CallbackStack$.apply')
+f(3,538,345,1,'cats/effect/IOFiber.<init>')
+f(4,538,345,1,'cats/effect/IO.unsafeRunFiber')
+f(5,538,345,1,'cats/effect/IO.unsafeRunAsync')
+f(6,538,345,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(7,538,345,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(8,538,345,1,'kyo/bench/Bench.syncCats')
+f(9,538,345,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(10,538,345,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(11,538,345,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(12,538,345,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(13,538,345,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(14,538,345,1,'java/lang/reflect/Method.invoke')
+f(15,538,345,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,538,345,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,538,345,1,'java/util/concurrent/FutureTask.run')
+f(18,538,345,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(19,538,345,1,'java/util/concurrent/FutureTask.run')
+f(20,538,345,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(21,538,345,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(22,538,345,1,'java/lang/Thread.run')
+f(1,883,65,2,'cats.effect.IO$$Lambda$92+0x0000000800d5e7c0')
+f(2,883,65,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,883,65,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,883,65,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,883,65,1,'cats/effect/IO.unsafeRunAsync')
+f(6,883,65,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(7,883,65,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(8,883,65,1,'kyo/bench/Bench.syncCats')
+f(9,883,65,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(10,883,65,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(11,883,65,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(12,883,65,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(13,883,65,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(14,883,65,1,'java/lang/reflect/Method.invoke')
+f(15,883,65,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,883,65,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,883,65,1,'java/util/concurrent/FutureTask.run')
+f(18,883,65,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(19,883,65,1,'java/util/concurrent/FutureTask.run')
+f(20,883,65,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(21,883,65,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(22,883,65,1,'java/lang/Thread.run')
+f(1,948,204,2,'cats.effect.IO$$Lambda$93+0x0000000800d5ea80')
+f(2,948,204,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,948,204,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,948,204,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,948,204,1,'cats/effect/IO.unsafeRunAsync')
+f(6,948,204,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(7,948,204,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(8,948,204,1,'kyo/bench/Bench.syncCats')
+f(9,948,204,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(10,948,204,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(11,948,204,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(12,948,204,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(13,948,204,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(14,948,204,1,'java/lang/reflect/Method.invoke')
+f(15,948,204,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,948,204,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,948,204,1,'java/util/concurrent/FutureTask.run')
+f(18,948,204,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(19,948,204,1,'java/util/concurrent/FutureTask.run')
+f(20,948,204,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(21,948,204,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(22,948,204,1,'java/lang/Thread.run')
+f(1,1152,152,2,'cats.effect.IO$$Lambda$94+0x0000000800d5ee88')
+f(2,1152,152,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,1152,152,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,1152,152,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,1152,152,1,'cats/effect/IO.unsafeRunAsync')
+f(6,1152,152,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(7,1152,152,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(8,1152,152,1,'kyo/bench/Bench.syncCats')
+f(9,1152,152,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(10,1152,152,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(11,1152,152,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(12,1152,152,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(13,1152,152,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(14,1152,152,1,'java/lang/reflect/Method.invoke')
+f(15,1152,152,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,1152,152,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,1152,152,1,'java/util/concurrent/FutureTask.run')
+f(18,1152,152,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(19,1152,152,1,'java/util/concurrent/FutureTask.run')
+f(20,1152,152,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(21,1152,152,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(22,1152,152,1,'java/lang/Thread.run')
+f(1,1304,483,2,'cats.effect.IO$$Lambda$95+0x0000000800d5a000')
+f(2,1304,483,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,1304,483,1,'java/lang/invoke/LambdaForm$DMH.0x0000000800d58c00.newInvokeSpecial')
+f(4,1304,483,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,1304,483,1,'cats/effect/IO.unsafeRunFiber')
+f(6,1304,483,1,'cats/effect/IO.unsafeRunAsync')
+f(7,1304,483,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(8,1304,483,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(9,1304,483,1,'kyo/bench/Bench.syncCats')
+f(10,1304,483,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(11,1304,483,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(12,1304,483,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(13,1304,483,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(14,1304,483,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(15,1304,483,1,'java/lang/reflect/Method.invoke')
+f(16,1304,483,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,1304,483,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,1304,483,1,'java/util/concurrent/FutureTask.run')
+f(19,1304,483,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(20,1304,483,1,'java/util/concurrent/FutureTask.run')
+f(21,1304,483,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(22,1304,483,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(23,1304,483,1,'java/lang/Thread.run')
+f(1,1787,261,2,'cats.effect.IO$$anon$3')
+f(2,1787,261,1,'cats/effect/IO$.async')
+f(3,1787,261,1,'cats/effect/IOFiber.<init>')
+f(4,1787,261,1,'cats/effect/IO.unsafeRunFiber')
+f(5,1787,261,1,'cats/effect/IO.unsafeRunAsync')
+f(6,1787,261,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(7,1787,261,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(8,1787,261,1,'kyo/bench/Bench.syncCats')
+f(9,1787,261,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(10,1787,261,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(11,1787,261,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(12,1787,261,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(13,1787,261,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(14,1787,261,1,'java/lang/reflect/Method.invoke')
+f(15,1787,261,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,1787,261,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,1787,261,1,'java/util/concurrent/FutureTask.run')
+f(18,1787,261,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(19,1787,261,1,'java/util/concurrent/FutureTask.run')
+f(20,1787,261,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(21,1787,261,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(22,1787,261,1,'java/lang/Thread.run')
+f(1,2048,16983,2,'cats.effect.IO$Delay')
+f(2,2048,16983,1,'cats/effect/IO$Delay$.apply')
+f(3,2048,16983,1,'cats/effect/IO$.delay')
+f(4,2048,16983,1,'cats/effect/IO$.apply')
+f(5,2048,253,1,'kyo/bench/NarrowBindBench.catsBench')
+f(6,2048,253,1,'kyo/bench/Bench.syncCats')
+f(7,2048,253,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(8,2048,253,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(9,2048,253,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(10,2048,253,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(11,2048,253,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(12,2048,253,1,'java/lang/reflect/Method.invoke')
+f(13,2048,253,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(14,2048,253,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(15,2048,253,1,'java/util/concurrent/FutureTask.run')
+f(16,2048,253,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(17,2048,253,1,'java/util/concurrent/FutureTask.run')
+f(18,2048,253,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(19,2048,253,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(20,2048,253,1,'java/lang/Thread.run')
+f(5,2301,16730,1,'kyo/bench/NarrowBindBench.loop$2')
+f(6,2301,2,1,'kyo/bench/NarrowBindBench.catsBench$$anonfun$2')
+f(7,2301,2,1,'kyo/bench/NarrowBindBench.catsBench$$anonfun$adapted$1')
+f(8,2301,2,1,'kyo/bench/NarrowBindBench$$Lambda$40.0x0000000800c8d578.apply')
+f(9,2301,2,1,'cats/effect/IOFiber.runLoop')
+f(10,2301,2,1,'cats/effect/IOFiber.execR')
+f(11,2301,2,1,'cats/effect/IOFiber.run')
+f(12,2301,2,1,'cats/effect/unsafe/WorkerThread.run')
+f(6,2303,16728,1,'kyo/bench/NarrowBindBench.loop$2$$anonfun$2')
+f(7,2303,16728,1,'kyo/bench/NarrowBindBench.loop$2$$anonfun$adapted$1')
+f(8,2303,16728,1,'kyo/bench/NarrowBindBench$$Lambda$99.0x0000000800d594c0.apply')
+f(9,2303,16728,1,'cats/effect/IOFiber.runLoop')
+f(10,2303,15823,1,'cats/effect/IOFiber.autoCedeR')
+f(11,2303,15823,1,'cats/effect/IOFiber.run')
+f(12,2303,15823,1,'cats/effect/unsafe/WorkerThread.run')
+f(10,18126,905,1,'cats/effect/IOFiber.execR')
+f(11,18126,905,1,'cats/effect/IOFiber.run')
+f(12,18126,905,1,'cats/effect/unsafe/WorkerThread.run')
+f(1,19031,14471,2,'cats.effect.IO$FlatMap')
+f(2,19031,14471,1,'cats/effect/IO$FlatMap$.apply')
+f(3,19031,14471,1,'cats/effect/IO.flatMap')
+f(4,19031,85,1,'kyo/bench/NarrowBindBench.catsBench')
+f(5,19031,85,1,'kyo/bench/Bench.syncCats')
+f(6,19031,85,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(7,19031,85,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(8,19031,85,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(9,19031,85,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(10,19031,85,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(11,19031,85,1,'java/lang/reflect/Method.invoke')
+f(12,19031,85,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(13,19031,85,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(14,19031,85,1,'java/util/concurrent/FutureTask.run')
+f(15,19031,85,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(16,19031,85,1,'java/util/concurrent/FutureTask.run')
+f(17,19031,85,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(18,19031,85,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(19,19031,85,1,'java/lang/Thread.run')
+f(4,19116,14386,1,'kyo/bench/NarrowBindBench.loop$2')
+f(5,19116,14386,1,'kyo/bench/NarrowBindBench.loop$2$$anonfun$2')
+f(6,19116,14386,1,'kyo/bench/NarrowBindBench.loop$2$$anonfun$adapted$1')
+f(7,19116,14386,1,'kyo/bench/NarrowBindBench$$Lambda$99.0x0000000800d594c0.apply')
+f(8,19116,14386,1,'cats/effect/IOFiber.runLoop')
+f(9,19116,13489,1,'cats/effect/IOFiber.autoCedeR')
+f(10,19116,13489,1,'cats/effect/IOFiber.run')
+f(11,19116,13489,1,'cats/effect/unsafe/WorkerThread.run')
+f(9,32605,897,1,'cats/effect/IOFiber.execR')
+f(10,32605,897,1,'cats/effect/IOFiber.run')
+f(11,32605,897,1,'cats/effect/unsafe/WorkerThread.run')
+f(1,33502,177,2,'cats.effect.IO$IOCont')
+f(2,33502,177,1,'cats/effect/IO$IOCont$.apply')
+f(3,33502,177,1,'cats/effect/IO$.async')
+f(4,33502,177,1,'cats/effect/IOFiber.<init>')
+f(5,33502,177,1,'cats/effect/IO.unsafeRunFiber')
+f(6,33502,177,1,'cats/effect/IO.unsafeRunAsync')
+f(7,33502,177,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(8,33502,177,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(9,33502,177,1,'kyo/bench/Bench.syncCats')
+f(10,33502,177,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(11,33502,177,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(12,33502,177,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(13,33502,177,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(14,33502,177,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(15,33502,177,1,'java/lang/reflect/Method.invoke')
+f(16,33502,177,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,33502,177,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,33502,177,1,'java/util/concurrent/FutureTask.run')
+f(19,33502,177,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(20,33502,177,1,'java/util/concurrent/FutureTask.run')
+f(21,33502,177,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(22,33502,177,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(23,33502,177,1,'java/lang/Thread.run')
+f(1,33679,167,2,'cats.effect.IO$Uncancelable')
+f(2,33679,167,1,'cats/effect/IO$Uncancelable$.apply')
+f(3,33679,167,1,'cats/effect/IO$.uncancelable')
+f(4,33679,167,1,'cats/effect/IOFiber.<init>')
+f(5,33679,167,1,'cats/effect/IO.unsafeRunFiber')
+f(6,33679,167,1,'cats/effect/IO.unsafeRunAsync')
+f(7,33679,167,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(8,33679,167,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(9,33679,167,1,'kyo/bench/Bench.syncCats')
+f(10,33679,167,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(11,33679,167,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(12,33679,167,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(13,33679,167,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(14,33679,167,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(15,33679,167,1,'java/lang/reflect/Method.invoke')
+f(16,33679,167,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,33679,167,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,33679,167,1,'java/util/concurrent/FutureTask.run')
+f(19,33679,167,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(20,33679,167,1,'java/util/concurrent/FutureTask.run')
+f(21,33679,167,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(22,33679,167,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(23,33679,167,1,'java/lang/Thread.run')
+f(1,33846,160,2,'cats.effect.IOFiber$$Lambda$96+0x0000000800d5b538')
+f(2,33846,160,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,33846,160,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,33846,160,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,33846,160,1,'cats/effect/IOFiber.<init>')
+f(6,33846,160,1,'cats/effect/IO.unsafeRunFiber')
+f(7,33846,160,1,'cats/effect/IO.unsafeRunAsync')
+f(8,33846,160,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(9,33846,160,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(10,33846,160,1,'kyo/bench/Bench.syncCats')
+f(11,33846,160,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(12,33846,160,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(13,33846,160,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,33846,160,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,33846,160,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,33846,160,1,'java/lang/reflect/Method.invoke')
+f(17,33846,160,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,33846,160,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,33846,160,1,'java/util/concurrent/FutureTask.run')
+f(20,33846,160,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,33846,160,1,'java/util/concurrent/FutureTask.run')
+f(22,33846,160,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,33846,160,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,33846,160,1,'java/lang/Thread.run')
+f(1,34006,96,2,'cats.effect.IOFiber$$Lambda$97+0x0000000800d5bb28')
+f(2,34006,96,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,34006,96,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,34006,96,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,34006,96,1,'cats/effect/IOFiber.<init>')
+f(6,34006,96,1,'cats/effect/IO.unsafeRunFiber')
+f(7,34006,96,1,'cats/effect/IO.unsafeRunAsync')
+f(8,34006,96,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(9,34006,96,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(10,34006,96,1,'kyo/bench/Bench.syncCats')
+f(11,34006,96,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(12,34006,96,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(13,34006,96,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,34006,96,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,34006,96,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,34006,96,1,'java/lang/reflect/Method.invoke')
+f(17,34006,96,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,34006,96,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,34006,96,1,'java/util/concurrent/FutureTask.run')
+f(20,34006,96,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,34006,96,1,'java/util/concurrent/FutureTask.run')
+f(22,34006,96,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,34006,96,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,34006,96,1,'java/lang/Thread.run')
+f(1,34102,427,2,'cats.effect.IOFiber')
+f(2,34102,427,1,'cats/effect/IO.unsafeRunFiber')
+f(3,34102,427,1,'cats/effect/IO.unsafeRunAsync')
+f(4,34102,427,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(5,34102,427,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(6,34102,427,1,'kyo/bench/Bench.syncCats')
+f(7,34102,427,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(8,34102,427,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(9,34102,427,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(10,34102,427,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(11,34102,427,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(12,34102,427,1,'java/lang/reflect/Method.invoke')
+f(13,34102,427,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(14,34102,427,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(15,34102,427,1,'java/util/concurrent/FutureTask.run')
+f(16,34102,427,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(17,34102,427,1,'java/util/concurrent/FutureTask.run')
+f(18,34102,427,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(19,34102,427,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(20,34102,427,1,'java/lang/Thread.run')
+f(1,34529,165,5,'cats.effect.IOFiber')
+f(2,34529,165,1,'cats/effect/IO.unsafeRunFiber')
+f(3,34529,165,1,'cats/effect/IO.unsafeRunAsync')
+f(4,34529,165,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(5,34529,165,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(6,34529,165,1,'kyo/bench/Bench.syncCats')
+f(7,34529,165,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(8,34529,165,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(9,34529,165,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(10,34529,165,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(11,34529,165,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(12,34529,165,1,'java/lang/reflect/Method.invoke')
+f(13,34529,165,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(14,34529,165,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(15,34529,165,1,'java/util/concurrent/FutureTask.run')
+f(16,34529,165,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(17,34529,165,1,'java/util/concurrent/FutureTask.run')
+f(18,34529,165,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(19,34529,165,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(20,34529,165,1,'java/lang/Thread.run')
+f(1,34694,279,2,'cats.effect.IOPlatform$$Lambda$100+0x0000000800d59c98')
+f(2,34694,279,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,34694,279,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,34694,279,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,34694,279,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(6,34694,279,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(7,34694,279,1,'kyo/bench/Bench.syncCats')
+f(8,34694,279,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(9,34694,279,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(10,34694,279,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(11,34694,279,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(12,34694,279,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(13,34694,279,1,'java/lang/reflect/Method.invoke')
+f(14,34694,279,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(15,34694,279,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,34694,279,1,'java/util/concurrent/FutureTask.run')
+f(17,34694,279,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(18,34694,279,1,'java/util/concurrent/FutureTask.run')
+f(19,34694,279,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(20,34694,279,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(21,34694,279,1,'java/lang/Thread.run')
+f(1,34973,104,2,'cats.effect.IOPlatform$$Lambda$91+0x0000000800d5e3b8')
+f(2,34973,104,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,34973,104,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,34973,104,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,34973,104,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(6,34973,104,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(7,34973,104,1,'kyo/bench/Bench.syncCats')
+f(8,34973,104,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(9,34973,104,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(10,34973,104,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(11,34973,104,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(12,34973,104,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(13,34973,104,1,'java/lang/reflect/Method.invoke')
+f(14,34973,104,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(15,34973,104,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,34973,104,1,'java/util/concurrent/FutureTask.run')
+f(17,34973,104,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(18,34973,104,1,'java/util/concurrent/FutureTask.run')
+f(19,34973,104,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(20,34973,104,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(21,34973,104,1,'java/lang/Thread.run')
+f(1,35077,92,2,'int[]')
+f(2,35077,92,1,'cats/effect/ByteStack$.create')
+f(3,35077,92,1,'cats/effect/IOFiber.execR')
+f(4,35077,92,1,'cats/effect/IOFiber.run')
+f(5,35077,92,1,'cats/effect/unsafe/WorkerThread.run')
+f(1,35169,7621,2,'java.lang.Integer')
+f(2,35169,7621,1,'java/lang/Integer.valueOf')
+f(3,35169,2,1,'kyo/bench/NarrowBindBench$$Lambda$101.0x0000000800d60630.apply')
+f(4,35169,2,1,'cats/effect/IOFiber.runLoop')
+f(5,35169,2,1,'cats/effect/IOFiber.autoCedeR')
+f(6,35169,2,1,'cats/effect/IOFiber.run')
+f(7,35169,2,1,'cats/effect/unsafe/WorkerThread.run')
+f(3,35171,7619,1,'kyo/bench/NarrowBindBench$$Lambda$98.0x0000000800d59208.apply')
+f(4,35171,7619,1,'cats/effect/IOFiber.runLoop')
+f(5,35171,7281,1,'cats/effect/IOFiber.autoCedeR')
+f(6,35171,7281,1,'cats/effect/IOFiber.run')
+f(7,35171,7281,1,'cats/effect/unsafe/WorkerThread.run')
+f(5,42452,338,1,'cats/effect/IOFiber.execR')
+f(6,42452,338,1,'cats/effect/IOFiber.run')
+f(7,42452,338,1,'cats/effect/unsafe/WorkerThread.run')
+f(1,42790,288,2,'java.lang.Object[]')
+f(2,42790,4,1,'cats/effect/ArrayStack.init')
+f(3,42790,4,1,'cats/effect/IOFiber.execR')
+f(4,42790,4,1,'cats/effect/IOFiber.run')
+f(5,42790,4,1,'cats/effect/unsafe/WorkerThread.run')
+f(2,42794,284,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(3,42794,284,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(4,42794,284,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(5,42794,284,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(6,42794,284,1,'kyo/bench/Bench.syncCats')
+f(7,42794,284,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(8,42794,284,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(9,42794,284,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(10,42794,284,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(11,42794,284,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(12,42794,284,1,'java/lang/reflect/Method.invoke')
+f(13,42794,284,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(14,42794,284,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(15,42794,284,1,'java/util/concurrent/FutureTask.run')
+f(16,42794,284,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(17,42794,284,1,'java/util/concurrent/FutureTask.run')
+f(18,42794,284,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(19,42794,284,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(20,42794,284,1,'java/lang/Thread.run')
+f(1,43078,477,2,'java.util.concurrent.ArrayBlockingQueue')
+f(2,43078,477,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(3,43078,477,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(4,43078,477,1,'kyo/bench/Bench.syncCats')
+f(5,43078,477,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(6,43078,477,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(7,43078,477,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(8,43078,477,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(9,43078,477,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(10,43078,477,1,'java/lang/reflect/Method.invoke')
+f(11,43078,477,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(12,43078,477,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(13,43078,477,1,'java/util/concurrent/FutureTask.run')
+f(14,43078,477,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(15,43078,477,1,'java/util/concurrent/FutureTask.run')
+f(16,43078,477,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(17,43078,477,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(18,43078,477,1,'java/lang/Thread.run')
+f(1,43555,207,2,'java.util.concurrent.ConcurrentLinkedQueue$Node')
+f(2,43555,207,1,'java/util/concurrent/ConcurrentLinkedQueue.offer')
+f(3,43555,207,1,'cats/effect/unsafe/ScalQueue.offer')
+f(4,43555,207,1,'cats/effect/unsafe/WorkStealingThreadPool.scheduleExternal')
+f(5,43555,207,1,'cats/effect/unsafe/WorkStealingThreadPool.execute')
+f(6,43555,207,1,'cats/effect/IO.unsafeRunFiber')
+f(7,43555,207,1,'cats/effect/IO.unsafeRunAsync')
+f(8,43555,207,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(9,43555,207,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(10,43555,207,1,'kyo/bench/Bench.syncCats')
+f(11,43555,207,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(12,43555,207,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(13,43555,207,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,43555,207,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,43555,207,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,43555,207,1,'java/lang/reflect/Method.invoke')
+f(17,43555,207,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,43555,207,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,43555,207,1,'java/util/concurrent/FutureTask.run')
+f(20,43555,207,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,43555,207,1,'java/util/concurrent/FutureTask.run')
+f(22,43555,207,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,43555,207,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,43555,207,1,'java/lang/Thread.run')
+f(1,43762,1,2,'java.util.concurrent.atomic.AtomicInteger')
+f(2,43762,1,1,'org/openjdk/jmh/runner/InfraControlL2.<init>')
+f(3,43762,1,1,'org/openjdk/jmh/runner/InfraControlL3.<init>')
+f(4,43762,1,1,'org/openjdk/jmh/runner/InfraControlL4.<init>')
+f(5,43762,1,1,'org/openjdk/jmh/runner/InfraControl.<init>')
+f(6,43762,1,1,'org/openjdk/jmh/runner/BenchmarkHandler.runIteration')
+f(7,43762,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(8,43762,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(9,43762,1,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(10,43762,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(11,43762,1,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(12,43762,1,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(1,43763,366,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionNode')
+f(2,43763,366,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject.awaitNanos')
+f(3,43763,366,1,'java/util/concurrent/ArrayBlockingQueue.poll')
+f(4,43763,366,1,'cats/effect/IOPlatform.$anonfun$1')
+f(5,43763,366,1,'cats/effect/IOPlatform$$Lambda$100.0x0000000800d59c98.apply')
+f(6,43763,366,1,'scala/concurrent/BlockContext$DefaultBlockContext$.blockOn')
+f(7,43763,366,1,'scala/concurrent/package$.blocking')
+f(8,43763,366,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(9,43763,366,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(10,43763,366,1,'kyo/bench/Bench.syncCats')
+f(11,43763,366,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(12,43763,366,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(13,43763,366,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,43763,366,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,43763,366,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,43763,366,1,'java/lang/reflect/Method.invoke')
+f(17,43763,366,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,43763,366,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,43763,366,1,'java/util/concurrent/FutureTask.run')
+f(20,43763,366,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,43763,366,1,'java/util/concurrent/FutureTask.run')
+f(22,43763,366,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,43763,366,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,43763,366,1,'java/lang/Thread.run')
+f(1,44129,534,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject')
+f(2,44129,534,1,'java/util/concurrent/locks/ReentrantLock$Sync.newCondition')
+f(3,44129,534,1,'java/util/concurrent/locks/ReentrantLock.newCondition')
+f(4,44129,534,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(5,44129,534,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(6,44129,534,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(7,44129,534,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(8,44129,534,1,'kyo/bench/Bench.syncCats')
+f(9,44129,534,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(10,44129,534,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(11,44129,534,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(12,44129,534,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(13,44129,534,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(14,44129,534,1,'java/lang/reflect/Method.invoke')
+f(15,44129,534,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,44129,534,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,44129,534,1,'java/util/concurrent/FutureTask.run')
+f(18,44129,534,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(19,44129,534,1,'java/util/concurrent/FutureTask.run')
+f(20,44129,534,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(21,44129,534,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(22,44129,534,1,'java/lang/Thread.run')
+f(1,44663,9,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$ExclusiveNode')
+f(2,44663,9,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.tryInitializeHead')
+f(3,44663,9,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.enqueue')
+f(4,44663,9,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject.doSignal')
+f(5,44663,9,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject.signal')
+f(6,44663,9,1,'java/util/concurrent/ArrayBlockingQueue.enqueue')
+f(7,44663,9,1,'java/util/concurrent/ArrayBlockingQueue.offer')
+f(8,44663,9,1,'cats/effect/IOPlatform.unsafeRunTimed$$anonfun$1')
+f(9,44663,9,1,'cats/effect/IOPlatform$$Lambda$91.0x0000000800d5e3b8.applyVoid')
+f(10,44663,9,1,'scala/runtime/function/JProcedure1.apply')
+f(11,44663,9,1,'scala/runtime/function/JProcedure1.apply')
+f(12,44663,9,1,'cats/effect/IO.unsafeRunAsync$$anonfun$3')
+f(13,44663,9,1,'cats/effect/IO$$Lambda$94.0x0000000800d5ee88.applyVoid')
+f(14,44663,9,1,'scala/runtime/function/JProcedure1.apply')
+f(15,44663,9,1,'scala/runtime/function/JProcedure1.apply')
+f(16,44663,9,1,'cats/effect/IO.$anonfun$6$$anonfun$3')
+f(17,44663,9,1,'cats/effect/IO$$Lambda$104.0x0000000800d614b0.applyVoid')
+f(18,44663,9,1,'scala/runtime/function/JProcedure1.apply')
+f(19,44663,9,1,'scala/runtime/function/JProcedure1.apply')
+f(20,44663,9,1,'cats/effect/kernel/Outcome.fold')
+f(21,44663,9,1,'cats/effect/kernel/Outcome.fold$')
+f(22,44663,9,1,'cats/effect/kernel/Outcome$Succeeded.fold')
+f(23,44663,9,1,'cats/effect/IO.$anonfun$6')
+f(24,44663,9,1,'cats/effect/IO$$Lambda$95.0x0000000800d5a000.applyVoid')
+f(25,44663,9,1,'scala/runtime/function/JProcedure1.apply')
+f(26,44663,9,1,'scala/runtime/function/JProcedure1.apply')
+f(27,44663,9,1,'cats/effect/CallbackStack.apply')
+f(28,44663,9,1,'cats/effect/IOFiber.done')
+f(29,44663,9,1,'cats/effect/IOFiber.runTerminusSuccessK')
+f(30,44663,9,1,'cats/effect/IOFiber.succeeded')
+f(31,44663,9,1,'cats/effect/IOFiber.runLoop')
+f(32,44663,9,1,'cats/effect/IOFiber.autoCedeR')
+f(33,44663,9,1,'cats/effect/IOFiber.run')
+f(34,44663,9,1,'cats/effect/unsafe/WorkerThread.run')
+f(1,44672,5,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode')
+f(2,44672,5,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(3,44672,5,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireSharedInterruptibly')
+f(4,44672,5,1,'java/util/concurrent/CountDownLatch.await')
+f(5,44672,5,1,'org/openjdk/jmh/runner/InfraControlL2.awaitWarmdownReady')
+f(6,44672,5,1,'org/openjdk/jmh/runner/InfraControl.awaitWarmdownReady')
+f(7,44672,5,1,'org/openjdk/jmh/runner/BenchmarkHandler.runIteration')
+f(8,44672,5,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(9,44672,5,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(10,44672,5,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(11,44672,5,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(12,44672,5,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(13,44672,5,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(1,44677,134,2,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(2,44677,134,1,'java/util/concurrent/locks/ReentrantLock.<init>')
+f(3,44677,134,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(4,44677,134,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(5,44677,134,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(6,44677,134,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(7,44677,134,1,'kyo/bench/Bench.syncCats')
+f(8,44677,134,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(9,44677,134,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(10,44677,134,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(11,44677,134,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(12,44677,134,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(13,44677,134,1,'java/lang/reflect/Method.invoke')
+f(14,44677,134,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(15,44677,134,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,44677,134,1,'java/util/concurrent/FutureTask.run')
+f(17,44677,134,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(18,44677,134,1,'java/util/concurrent/FutureTask.run')
+f(19,44677,134,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(20,44677,134,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(21,44677,134,1,'java/lang/Thread.run')
+f(1,44811,309,2,'java.util.concurrent.locks.ReentrantLock')
+f(2,44811,309,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(3,44811,309,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(4,44811,309,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(5,44811,309,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(6,44811,309,1,'kyo/bench/Bench.syncCats')
+f(7,44811,309,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(8,44811,309,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(9,44811,309,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(10,44811,309,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(11,44811,309,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(12,44811,309,1,'java/lang/reflect/Method.invoke')
+f(13,44811,309,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(14,44811,309,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(15,44811,309,1,'java/util/concurrent/FutureTask.run')
+f(16,44811,309,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(17,44811,309,1,'java/util/concurrent/FutureTask.run')
+f(18,44811,309,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(19,44811,309,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(20,44811,309,1,'java/lang/Thread.run')
+f(1,45120,1,2,'kyo.bench.NarrowBindBench$$Lambda$101+0x0000000800d60630')
+f(2,45120,1,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,45120,1,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,45120,1,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,45120,1,1,'kyo/bench/NarrowBindBench.loop$2')
+f(6,45120,1,1,'kyo/bench/NarrowBindBench.loop$2$$anonfun$2')
+f(7,45120,1,1,'kyo/bench/NarrowBindBench.loop$2$$anonfun$adapted$1')
+f(8,45120,1,1,'kyo/bench/NarrowBindBench$$Lambda$99.0x0000000800d594c0.apply')
+f(9,45120,1,1,'cats/effect/IOFiber.runLoop')
+f(10,45120,1,1,'cats/effect/IOFiber.autoCedeR')
+f(11,45120,1,1,'cats/effect/IOFiber.run')
+f(12,45120,1,1,'cats/effect/unsafe/WorkerThread.run')
+f(1,45121,199,2,'kyo.bench.NarrowBindBench$$Lambda$40+0x0000000800c8d578')
+f(2,45121,162,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,45121,162,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,45121,162,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,45121,162,1,'kyo/bench/NarrowBindBench.catsBench')
+f(6,45121,162,1,'kyo/bench/Bench.syncCats')
+f(7,45121,162,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(8,45121,162,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(9,45121,162,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(10,45121,162,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(11,45121,162,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(12,45121,162,1,'java/lang/reflect/Method.invoke')
+f(13,45121,162,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(14,45121,162,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(15,45121,162,1,'java/util/concurrent/FutureTask.run')
+f(16,45121,162,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(17,45121,162,1,'java/util/concurrent/FutureTask.run')
+f(18,45121,162,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(19,45121,162,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(20,45121,162,1,'java/lang/Thread.run')
+f(2,45283,37,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(3,45283,37,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(4,45283,37,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(5,45283,37,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(6,45283,37,1,'kyo/bench/NarrowBindBench.catsBench')
+f(7,45283,37,1,'kyo/bench/Bench.syncCats')
+f(8,45283,37,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(9,45283,37,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(10,45283,37,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(11,45283,37,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(12,45283,37,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(13,45283,37,1,'java/lang/reflect/Method.invoke')
+f(14,45283,37,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(15,45283,37,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,45283,37,1,'java/util/concurrent/FutureTask.run')
+f(17,45283,37,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(18,45283,37,1,'java/util/concurrent/FutureTask.run')
+f(19,45283,37,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(20,45283,37,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(21,45283,37,1,'java/lang/Thread.run')
+f(1,45320,8494,2,'kyo.bench.NarrowBindBench$$Lambda$98+0x0000000800d59208')
+f(2,45320,8494,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,45320,8494,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,45320,8494,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,45320,8494,1,'kyo/bench/NarrowBindBench.loop$2')
+f(6,45320,1,1,'kyo/bench/NarrowBindBench.catsBench$$anonfun$2')
+f(7,45320,1,1,'kyo/bench/NarrowBindBench.catsBench$$anonfun$adapted$1')
+f(8,45320,1,1,'kyo/bench/NarrowBindBench$$Lambda$40.0x0000000800c8d578.apply')
+f(9,45320,1,1,'cats/effect/IOFiber.runLoop')
+f(10,45320,1,1,'cats/effect/IOFiber.execR')
+f(11,45320,1,1,'cats/effect/IOFiber.run')
+f(12,45320,1,1,'cats/effect/unsafe/WorkerThread.run')
+f(6,45321,8493,1,'kyo/bench/NarrowBindBench.loop$2$$anonfun$2')
+f(7,45321,8493,1,'kyo/bench/NarrowBindBench.loop$2$$anonfun$adapted$1')
+f(8,45321,8493,1,'kyo/bench/NarrowBindBench$$Lambda$99.0x0000000800d594c0.apply')
+f(9,45321,8493,1,'cats/effect/IOFiber.runLoop')
+f(10,45321,7916,1,'cats/effect/IOFiber.autoCedeR')
+f(11,45321,7916,1,'cats/effect/IOFiber.run')
+f(12,45321,7916,1,'cats/effect/unsafe/WorkerThread.run')
+f(10,53237,577,1,'cats/effect/IOFiber.execR')
+f(11,53237,577,1,'cats/effect/IOFiber.run')
+f(12,53237,577,1,'cats/effect/unsafe/WorkerThread.run')
+f(1,53814,11300,2,'kyo.bench.NarrowBindBench$$Lambda$99+0x0000000800d594c0')
+f(2,53814,11300,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(3,53814,11300,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(4,53814,11300,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(5,53814,11300,1,'kyo/bench/NarrowBindBench.loop$2')
+f(6,53814,1,1,'kyo/bench/NarrowBindBench.catsBench$$anonfun$2')
+f(7,53814,1,1,'kyo/bench/NarrowBindBench.catsBench$$anonfun$adapted$1')
+f(8,53814,1,1,'kyo/bench/NarrowBindBench$$Lambda$40.0x0000000800c8d578.apply')
+f(9,53814,1,1,'cats/effect/IOFiber.runLoop')
+f(10,53814,1,1,'cats/effect/IOFiber.execR')
+f(11,53814,1,1,'cats/effect/IOFiber.run')
+f(12,53814,1,1,'cats/effect/unsafe/WorkerThread.run')
+f(6,53815,11299,1,'kyo/bench/NarrowBindBench.loop$2$$anonfun$2')
+f(7,53815,11299,1,'kyo/bench/NarrowBindBench.loop$2$$anonfun$adapted$1')
+f(8,53815,11299,1,'kyo/bench/NarrowBindBench$$Lambda$99.0x0000000800d594c0.apply')
+f(9,53815,11299,1,'cats/effect/IOFiber.runLoop')
+f(10,53815,10782,1,'cats/effect/IOFiber.autoCedeR')
+f(11,53815,10782,1,'cats/effect/IOFiber.run')
+f(12,53815,10782,1,'cats/effect/unsafe/WorkerThread.run')
+f(10,64597,517,1,'cats/effect/IOFiber.execR')
+f(11,64597,517,1,'cats/effect/IOFiber.run')
+f(12,64597,517,1,'cats/effect/unsafe/WorkerThread.run')
+f(1,65114,1,5,'org.openjdk.jmh.runner.InfraControl')
+f(2,65114,1,1,'org/openjdk/jmh/runner/BenchmarkHandler.runIteration')
+f(3,65114,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(4,65114,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(5,65114,1,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(6,65114,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(7,65114,1,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(8,65114,1,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(1,65115,286,2,'scala.Some')
+f(2,65115,286,1,'scala/Some$.apply')
+f(3,65115,286,1,'cats/effect/IOPlatform.unsafeRunTimed$$anonfun$3')
+f(4,65115,286,1,'cats/effect/IOPlatform$$Lambda$106.0x0000000800d61f60.apply')
+f(5,65115,286,1,'scala/util/Either.fold')
+f(6,65115,286,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(7,65115,286,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(8,65115,286,1,'kyo/bench/Bench.syncCats')
+f(9,65115,286,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(10,65115,286,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(11,65115,286,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(12,65115,286,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(13,65115,286,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(14,65115,286,1,'java/lang/reflect/Method.invoke')
+f(15,65115,286,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(16,65115,286,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,65115,286,1,'java/util/concurrent/FutureTask.run')
+f(18,65115,286,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(19,65115,286,1,'java/util/concurrent/FutureTask.run')
+f(20,65115,286,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(21,65115,286,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(22,65115,286,1,'java/lang/Thread.run')
+f(1,65401,284,2,'scala.concurrent.duration.FiniteDuration')
+f(2,65401,284,1,'scala/concurrent/duration/package$DurationLong.durationIn')
+f(3,65401,284,1,'scala/concurrent/duration/DurationConversions.nanoseconds')
+f(4,65401,284,1,'scala/concurrent/duration/DurationConversions.nanoseconds$')
+f(5,65401,284,1,'scala/concurrent/duration/package$DurationLong.nanoseconds')
+f(6,65401,284,1,'scala/concurrent/duration/DurationConversions.nanos')
+f(7,65401,284,1,'scala/concurrent/duration/DurationConversions.nanos$')
+f(8,65401,284,1,'scala/concurrent/duration/package$DurationLong.nanos')
+f(9,65401,284,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(10,65401,284,1,'kyo/bench/Bench.syncCats')
+f(11,65401,284,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(12,65401,284,1,'kyo/bench/jmh_generated/NarrowBindBench_syncCats_jmhTest.syncCats_Throughput')
+f(13,65401,284,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,65401,284,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,65401,284,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,65401,284,1,'java/lang/reflect/Method.invoke')
+f(17,65401,284,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,65401,284,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,65401,284,1,'java/util/concurrent/FutureTask.run')
+f(20,65401,284,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,65401,284,1,'java/util/concurrent/FutureTask.run')
+f(22,65401,284,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,65401,284,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,65401,284,1,'java/lang/Thread.run')
+f(1,65685,3,2,'scala.util.Right')
+f(2,65685,3,1,'scala/util/Right$.apply')
+f(3,65685,3,1,'cats/effect/IO.unsafeRunAsync$$anonfun$3')
+f(4,65685,3,1,'cats/effect/IO$$Lambda$94.0x0000000800d5ee88.applyVoid')
+f(5,65685,3,1,'scala/runtime/function/JProcedure1.apply')
+f(6,65685,3,1,'scala/runtime/function/JProcedure1.apply')
+f(7,65685,3,1,'cats/effect/IO.$anonfun$6$$anonfun$3')
+f(8,65685,3,1,'cats/effect/IO$$Lambda$104.0x0000000800d614b0.applyVoid')
+f(9,65685,3,1,'scala/runtime/function/JProcedure1.apply')
+f(10,65685,3,1,'scala/runtime/function/JProcedure1.apply')
+f(11,65685,3,1,'cats/effect/kernel/Outcome.fold')
+f(12,65685,3,1,'cats/effect/kernel/Outcome.fold$')
+f(13,65685,3,1,'cats/effect/kernel/Outcome$Succeeded.fold')
+f(14,65685,3,1,'cats/effect/IO.$anonfun$6')
+f(15,65685,3,1,'cats/effect/IO$$Lambda$95.0x0000000800d5a000.applyVoid')
+f(16,65685,3,1,'scala/runtime/function/JProcedure1.apply')
+f(17,65685,3,1,'scala/runtime/function/JProcedure1.apply')
+f(18,65685,3,1,'cats/effect/CallbackStack.apply')
+f(19,65685,3,1,'cats/effect/IOFiber.done')
+f(20,65685,3,1,'cats/effect/IOFiber.runTerminusSuccessK')
+f(21,65685,3,1,'cats/effect/IOFiber.succeeded')
+f(22,65685,3,1,'cats/effect/IOFiber.runLoop')
+f(23,65685,3,1,'cats/effect/IOFiber.autoCedeR')
+f(24,65685,3,1,'cats/effect/IOFiber.run')
+f(25,65685,3,1,'cats/effect/unsafe/WorkerThread.run')
+
+search();
+</script></body></html>
