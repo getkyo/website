@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 560px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>CPU profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(35);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,486,3,'all')
+f(1,0,14,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(2,0,14,3,'thread_native_entry(Thread*)')
+f(3,0,14,4,'Thread::call_run()')
+f(4,0,3,4,'GangWorker::run()')
+f(5,0,3,4,'GangWorker::loop()')
+f(6,0,2,4,'G1EvacuateRegionsBaseTask::work(unsigned int)')
+f(7,0,2,4,'G1EvacuateRegionsTask::scan_roots(G1ParScanThreadState*, unsigned int)')
+f(8,0,2,4,'G1RootProcessor::evacuate_roots(G1ParScanThreadState*, unsigned int)')
+f(9,0,2,4,'G1RootProcessor::process_java_roots(G1RootClosures*, G1GCPhaseTimes*, unsigned int)')
+f(10,0,2,4,'Threads::possibly_parallel_oops_do(bool, OopClosure*, CodeBlobClosure*)')
+f(11,0,1,4,'G1ParCopyClosure<(G1Barrier)0, false>::do_oop(oopDesc**)')
+f(11,1,1,4,'JavaThread::oops_do_frames(OopClosure*, CodeBlobClosure*) [clone .part.0]')
+f(12,1,1,4,'ConstantPool::impl_signature_ref_at(int, bool)')
+f(6,2,1,4,'void WeakProcessor::Task::work<G1STWIsAliveClosure, G1KeepAliveClosure>(unsigned int, G1STWIsAliveClosure*, G1KeepAliveClosure*)')
+f(4,3,11,4,'JavaThread::thread_main_inner()')
+f(5,3,11,4,'CompileBroker::compiler_thread_loop()')
+f(6,3,11,4,'CompileBroker::invoke_compiler_on_method(CompileTask*)')
+f(7,3,10,4,'C2Compiler::compile_method(ciEnv*, ciMethod*, int, bool, DirectiveSet*)')
+f(8,3,10,4,'Compile::Compile(ciEnv*, ciMethod*, int, bool, bool, bool, bool, bool, DirectiveSet*)')
+f(9,3,5,4,'Compile::Code_Gen()')
+f(10,3,1,4,'PhaseCFG::do_global_code_motion()')
+f(11,3,1,4,'PhaseCFG::global_code_motion()')
+f(12,3,1,4,'CProjNode::is_block_proj() const')
+f(10,4,3,4,'PhaseChaitin::Register_Allocate()')
+f(11,4,1,4,'PhaseChaitin::Simplify()')
+f(12,4,1,4,'IndexSetIterator::advance_and_next()')
+f(11,5,1,4,'PhaseChaitin::build_ifg_physical(ResourceArea*)')
+f(12,5,1,4,'PhaseChaitin::add_input_to_liveout(Block*, Node*, IndexSet*, double, PhaseChaitin::Pressure&, PhaseChaitin::Pressure&)')
+f(13,5,1,4,'MachNode::ideal_reg() const')
+f(11,6,1,4,'PhaseLive::compute(unsigned int)')
+f(12,6,1,4,'PhaseLive::add_liveout(Block*, IndexSet*, VectorSet&)')
+f(13,6,1,3,'/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2')
+f(10,7,1,4,'PhaseOutput::Output()')
+f(11,7,1,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(9,8,3,4,'Compile::Optimize()')
+f(10,8,1,4,'ConnectionGraph::do_analysis(Compile*, PhaseIterGVN*)')
+f(11,8,1,4,'ConnectionGraph::compute_escape()')
+f(12,8,1,4,'ConnectionGraph::add_node_to_connection_graph(Node*, Unique_Node_List*)')
+f(13,8,1,4,'ConnectionGraph::add_field(Node*, PointsToNode::EscapeState, int) [clone .part.0]')
+f(14,8,1,4,'Compile::find_alias_type(TypePtr const*, bool, ciField*)')
+f(10,9,1,4,'PhaseIdealLoop::optimize(PhaseIterGVN&, LoopOptsMode)')
+f(11,9,1,4,'PhaseIdealLoop::build_and_optimize(LoopOptsMode)')
+f(12,9,1,4,'PhaseIdealLoop::build_loop_late(VectorSet&, Node_List&, Node_Stack&)')
+f(13,9,1,4,'PhaseIdealLoop::build_loop_late_post_work(Node*, bool)')
+f(10,10,1,4,'PhaseIterGVN::optimize()')
+f(11,10,1,4,'PhaseIterGVN::transform_old(Node*)')
+f(12,10,1,4,'PhiNode::Ideal(PhaseGVN*, bool)')
+f(13,10,1,4,'PhiNode::is_data_loop(RegionNode*, Node*, PhaseGVN const*)')
+f(14,10,1,4,'Node::is_dead_loop_safe() const')
+f(9,11,2,4,'ParseGenerator::generate(JVMState*)')
+f(10,11,2,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(11,11,2,4,'Parse::do_all_blocks()')
+f(12,11,2,4,'Parse::do_one_block()')
+f(13,11,2,4,'Parse::do_call()')
+f(14,11,1,4,'Compile::call_generator(ciMethod*, int, bool, JVMState*, bool, float, ciKlass*, bool)')
+f(15,11,1,4,'ciMethod::resolve_invoke(ciKlass*, ciKlass*, bool, bool)')
+f(16,11,1,4,'ciObjectFactory::get_metadata(Metadata*)')
+f(17,11,1,4,'ciObjectFactory::create_new_metadata(Metadata*)')
+f(18,11,1,4,'ciMethod::ciMethod(methodHandle const&, ciInstanceKlass*)')
+f(19,11,1,4,'ciSignature::ciSignature(ciKlass*, constantPoolHandle const&, ciSymbol*)')
+f(20,11,1,4,'ciEnv::get_klass_by_name_impl(ciKlass*, constantPoolHandle const&, ciSymbol*, bool)')
+f(21,11,1,4,'ttyLocker::release_tty_if_locked()')
+f(22,11,1,3,'syscall')
+f(14,12,1,4,'PredictedCallGenerator::generate(JVMState*)')
+f(15,12,1,4,'ParseGenerator::generate(JVMState*)')
+f(16,12,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(17,12,1,4,'Parse::do_all_blocks()')
+f(18,12,1,4,'Parse::do_one_block()')
+f(19,12,1,4,'Parse::do_call()')
+f(20,12,1,4,'Compile::call_generator(ciMethod*, int, bool, JVMState*, bool, float, ciKlass*, bool)')
+f(21,12,1,4,'InlineTree::ok_to_inline(ciMethod*, JVMState*, ciCallProfile&, bool&)')
+f(22,12,1,4,'ciMethod::get_flow_analysis()')
+f(23,12,1,4,'ciTypeFlow::do_flow()')
+f(24,12,1,4,'ciTypeFlow::flow_types()')
+f(25,12,1,4,'ciTypeFlow::df_flow_types(ciTypeFlow::Block*, bool, ciTypeFlow::StateVector*, ciTypeFlow::JsrSet*)')
+f(26,12,1,4,'ciTypeFlow::flow_block(ciTypeFlow::Block*, ciTypeFlow::StateVector*, ciTypeFlow::JsrSet*)')
+f(27,12,1,4,'ciTypeFlow::StateVector::apply_one_bytecode(ciBytecodeStream*)')
+f(7,13,1,4,'Compiler::compile_method(ciEnv*, ciMethod*, int, bool, DirectiveSet*)')
+f(8,13,1,4,'Compilation::Compilation(AbstractCompiler*, ciEnv*, ciMethod*, int, BufferBlob*, bool, DirectiveSet*)')
+f(9,13,1,4,'Compilation::compile_method()')
+f(10,13,1,4,'Compilation::compile_java_method()')
+f(11,13,1,4,'Compilation::emit_lir()')
+f(12,13,1,4,'BlockList::iterate_forward(BlockClosure*)')
+f(13,13,1,4,'non-virtual thunk to LIRGenerator::block_do(BlockBegin*)')
+f(14,13,1,4,'LIRGenerator::do_LoadField(LoadField*)')
+f(15,13,1,3,'__tls_get_addr@plt')
+f(1,14,1,3,'[not_walkable_Java]')
+f(2,14,1,3,'_rethrow_Java')
+f(3,14,1,4,'OptoRuntime::rethrow_C(oopDesc*, JavaThread*, unsigned char*)')
+f(4,14,1,4,'SafepointMechanism::update_poll_values(JavaThread*)')
+f(5,14,1,4,'StackWatermarkSet::lowest_watermark(JavaThread*)')
+f(1,15,2,3,'[unknown]')
+f(2,15,1,3,'/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2')
+f(2,16,1,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(1,17,12,3,'[unknown_Java]')
+f(2,17,1,3,'ExceptionBlob')
+f(2,18,11,3,'pthread_cond_signal')
+f(3,20,9,5,'entry_SYSCALL_64_after_hwframe')
+f(4,20,9,5,'do_syscall_64')
+f(5,20,7,5,'__x64_sys_futex')
+f(6,20,7,5,'do_futex')
+f(7,20,6,5,'futex_wake')
+f(8,20,6,5,'wake_up_q')
+f(9,20,6,5,'_raw_spin_unlock_irqrestore')
+f(7,26,1,5,'mark_wake_futex')
+f(5,27,1,5,'syscall_enter_from_user_mode')
+f(5,28,1,5,'syscall_exit_to_user_mode')
+f(6,28,1,5,'exit_to_user_mode_prepare')
+f(7,28,1,5,'exit_to_user_mode_loop')
+f(8,28,1,5,'schedule')
+f(9,28,1,5,'__schedule')
+f(10,28,1,5,'finish_task_switch.isra.0')
+f(1,29,29,1,'java/lang/Thread.run')
+f(2,29,29,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(3,29,29,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(4,29,29,1,'java/util/concurrent/FutureTask.run')
+f(5,29,29,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(6,29,29,1,'java/util/concurrent/FutureTask.run')
+f(7,29,29,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(8,29,29,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(9,29,29,1,'java/lang/reflect/Method.invoke')
+f(10,29,29,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(11,29,29,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(12,29,29,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(13,29,29,1,'kyo/bench/jmh_generated/BroadFlatMapBench_forkZio_jmhTest.forkZio_Throughput')
+f(14,29,29,1,'kyo/bench/jmh_generated/BroadFlatMapBench_forkZio_jmhTest.forkZio_thrpt_jmhStub',0,0,1)
+f(15,30,28,1,'kyo/bench/Bench.forkZio')
+f(16,30,28,1,'zio/Unsafe$.unsafe')
+f(17,30,28,1,'kyo/bench/Bench$$Lambda$36.0x0000000800c2c000.apply')
+f(18,30,28,1,'kyo/bench/Bench.forkZio$$anonfun$1',3,0,0)
+f(19,30,1,2,'zio/Runtime$$anon$8.unsafe',1,0,0)
+f(20,30,1,2,'zio/Runtime.unsafe$',1,0,0)
+f(21,30,1,2,'zio/Runtime.unsafe',1,0,0)
+f(22,30,1,2,'zio/Runtime$$anon$1.<init>',1,0,0)
+f(19,31,26,1,'zio/Runtime$UnsafeAPIV1.run',1,0,0)
+f(20,31,13,1,'zio/Runtime$UnsafeAPIV1.runOrFork',1,0,0)
+f(21,31,1,2,'zio/FiberRefs.forkAs',1,0,0)
+f(22,31,1,2,'scala/collection/immutable/Map$Map1.transform',1,0,0)
+f(23,31,1,2,'scala/collection/immutable/Map$Map1.transform',1,0,0)
+f(24,31,1,2,'zio/FiberRefs$$Lambda$89.0x0000000800d2e5c8.apply',1,0,0)
+f(25,31,1,2,'zio/FiberRefs.$anonfun$1',1,0,0)
+f(26,31,1,2,'zio/FiberRef$unsafe$$anon$2.patch',1,0,0)
+f(27,31,1,2,'zio/Differ$$anon$6.patch',1,0,0)
+f(21,32,2,2,'zio/FiberRefs.updatedAs',1,0,0)
+f(22,32,1,2,'scala/Tuple2$.apply',1,0,0)
+f(22,33,1,1,'scala/collection/immutable/$colon$colon$.apply')
+f(23,33,1,1,'scala/collection/immutable/$colon$colon.<init>')
+f(24,33,1,1,'scala/collection/immutable/List.<init>')
+f(25,33,1,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(26,33,1,4,'InstanceKlass::allocate_instance(JavaThread*)')
+f(27,33,1,4,'MemAllocator::allocate() const')
+f(28,33,1,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(29,33,1,4,'G1Allocator::unsafe_max_tlab_alloc()')
+f(21,34,10,1,'zio/internal/FiberRuntime.start')
+f(22,34,10,1,'zio/internal/FiberRuntime.drainQueueLaterOnExecutor')
+f(23,34,9,1,'zio/Executor.submitOrThrow',1,0,0)
+f(24,34,9,1,'zio/internal/ZScheduler.submit',1,0,0)
+f(25,34,8,1,'java/util/concurrent/locks/LockSupport.unpark')
+f(26,34,8,1,'jdk/internal/misc/Unsafe.unpark')
+f(27,34,1,3,'Unsafe_Unpark')
+f(27,35,7,3,'pthread_cond_signal')
+f(28,35,7,5,'entry_SYSCALL_64_after_hwframe')
+f(29,35,7,5,'do_syscall_64')
+f(30,35,6,5,'__x64_sys_futex')
+f(31,35,6,5,'do_futex')
+f(32,35,6,5,'futex_wake')
+f(33,35,6,5,'wake_up_q')
+f(34,35,6,5,'_raw_spin_unlock_irqrestore')
+f(30,41,1,5,'syscall_enter_from_user_mode')
+f(25,42,1,2,'zio/internal/ZScheduler.isBlocking',1,0,0)
+f(26,42,1,2,'zio/internal/ZScheduler$$anon$2.put',1,0,0)
+f(23,43,1,2,'zio/internal/FiberRuntime.getCurrentExecutor',1,0,0)
+f(24,43,1,2,'zio/internal/FiberRuntime.getFiberRef',1,0,0)
+f(25,43,1,2,'zio/FiberRefs.getOrDefault',1,0,0)
+f(20,44,13,1,'zio/internal/OneShot.get')
+f(21,44,13,1,'java/lang/Object.wait')
+f(22,44,13,1,'java/lang/Object.wait')
+f(23,44,4,3,'JVM_MonitorWait')
+f(24,45,3,4,'ObjectSynchronizer::wait(Handle, long, JavaThread*)')
+f(25,45,2,4,'ObjectMonitor::wait(long, bool, JavaThread*)')
+f(26,45,2,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(25,47,1,4,'ObjectSynchronizer::inflate(Thread*, oopDesc*, ObjectSynchronizer::InflateCause)')
+f(26,47,1,4,'ObjectMonitor::ObjectMonitor(oopDesc*)')
+f(27,47,1,4,'WeakHandle::WeakHandle(OopStorage*, oopDesc*)')
+f(28,47,1,3,'pthread_mutex_unlock')
+f(23,48,9,3,'[unknown]')
+f(24,48,9,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(25,48,9,5,'entry_SYSCALL_64_after_hwframe')
+f(26,48,1,5,'__x64_sys_futex')
+f(26,49,8,5,'do_syscall_64')
+f(27,49,6,5,'__x64_sys_futex')
+f(28,50,5,5,'do_futex')
+f(29,50,5,5,'futex_wait')
+f(30,50,4,5,'futex_wait_queue_me')
+f(31,50,4,5,'schedule')
+f(32,50,4,5,'__schedule')
+f(33,50,4,5,'finish_task_switch.isra.0')
+f(30,54,1,5,'hash_futex')
+f(27,55,2,5,'syscall_enter_from_user_mode')
+f(19,57,1,2,'zio/ZIO$YieldNow.flatMap',1,0,0)
+f(20,57,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(21,57,1,2,'zio/ZIO.flatMap',1,0,0)
+f(22,57,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(1,58,428,1,'zio/internal/ZScheduler$$anon$4.run')
+f(2,58,25,1,'java/util/concurrent/locks/LockSupport.park')
+f(3,58,25,1,'jdk/internal/misc/Unsafe.park')
+f(4,58,8,3,'Unsafe_Park')
+f(5,59,5,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(5,64,2,4,'Parker::park(bool, long)')
+f(4,66,17,3,'[unknown]')
+f(5,66,17,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(6,70,13,5,'entry_SYSCALL_64_after_hwframe')
+f(7,70,13,5,'do_syscall_64')
+f(8,71,6,5,'__x64_sys_futex')
+f(9,71,6,5,'do_futex')
+f(10,71,6,5,'futex_wait')
+f(11,71,6,5,'futex_wait_queue_me')
+f(12,71,6,5,'schedule')
+f(13,71,6,5,'__schedule')
+f(14,71,6,5,'finish_task_switch.isra.0')
+f(8,77,3,5,'syscall_enter_from_user_mode')
+f(8,80,3,5,'syscall_exit_to_user_mode')
+f(9,80,3,5,'exit_to_user_mode_prepare')
+f(10,80,1,5,'blkcg_maybe_throttle_current')
+f(10,81,2,5,'exit_to_user_mode_loop')
+f(11,82,1,5,'__rseq_handle_notify_resume')
+f(2,83,15,1,'java/util/concurrent/locks/LockSupport.unpark')
+f(3,83,15,1,'jdk/internal/misc/Unsafe.unpark')
+f(4,83,15,3,'pthread_cond_signal')
+f(5,84,14,5,'entry_SYSCALL_64_after_hwframe')
+f(6,84,14,5,'do_syscall_64')
+f(7,84,11,5,'__x64_sys_futex')
+f(8,84,11,5,'do_futex')
+f(9,84,10,5,'futex_wake')
+f(10,84,10,5,'wake_up_q')
+f(11,84,10,5,'_raw_spin_unlock_irqrestore')
+f(9,94,1,5,'hash_futex')
+f(7,95,3,5,'syscall_enter_from_user_mode')
+f(2,98,386,1,'zio/internal/FiberRuntime.run')
+f(3,98,386,1,'zio/internal/FiberRuntime.drainQueueOnCurrentThread')
+f(4,98,1,3,'vtable stub')
+f(4,99,385,1,'zio/internal/FiberRuntime.evaluateMessageWhileSuspended')
+f(5,99,385,1,'zio/internal/FiberRuntime.evaluateEffect')
+f(6,99,3,2,'zio/internal/FiberRuntime.getSupervisor',3,0,0)
+f(7,99,3,2,'zio/internal/FiberRuntime.getFiberRef',3,0,0)
+f(8,100,2,2,'zio/FiberRefs.getOrDefault',2,0,0)
+f(9,100,1,2,'scala/Option.getOrElse',1,0,0)
+f(10,100,1,2,'zio/FiberRefs$$Lambda$91.0x0000000800d32ed8.apply',1,0,0)
+f(11,100,1,2,'zio/FiberRefs.getOrDefault$$anonfun$1',1,0,0)
+f(9,101,1,2,'zio/FiberRefs.get',1,0,0)
+f(10,101,1,2,'scala/collection/immutable/Map$Map1.get',1,0,0)
+f(11,101,1,2,'scala/runtime/BoxesRunTime.equals',1,0,0)
+f(12,101,1,2,'scala/runtime/BoxesRunTime.equals2',1,0,0)
+f(13,101,1,2,'java/lang/Object.equals',1,0,0)
+f(14,101,1,4,'SharedRuntime::complete_monitor_unlocking_C(oopDesc*, BasicLock*, JavaThread*)')
+f(15,101,1,4,'ObjectMonitor::exit(JavaThread*, bool)')
+f(6,102,379,1,'zio/internal/FiberRuntime.runLoop')
+f(7,102,1,1,'kyo/bench/Bench$$Lambda$76.0x0000000800d21640.apply')
+f(8,102,1,1,'kyo/bench/Bench.forkZio$$anonfun$1$$anonfun$1')
+f(9,102,1,1,'kyo/bench/BroadFlatMapBench.zioBench')
+f(10,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(11,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(12,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(13,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(14,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(15,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(16,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(17,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(18,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(19,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(20,102,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(7,103,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply')
+f(8,103,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2')
+f(9,103,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(10,103,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(11,103,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(12,103,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(13,103,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(14,103,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(15,103,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(16,103,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(7,104,377,1,'zio/internal/FiberRuntime.runLoop')
+f(8,104,377,1,'zio/internal/FiberRuntime.runLoop')
+f(9,104,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply')
+f(10,104,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2')
+f(11,104,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(12,104,1,2,'zio/ZIO$OnSuccess.flatMap',1,0,0)
+f(13,104,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(14,104,1,2,'zio/ZIO.flatMap',1,0,0)
+f(15,104,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(9,105,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$97.0x0000000800d6eeb0.apply')
+f(10,105,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1')
+f(11,105,1,1,'zio/ZIO$.succeed')
+f(12,105,1,1,'zio/ZIOCompanionVersionSpecific.succeed$')
+f(13,105,1,1,'zio/ZIOCompanionVersionSpecific.succeed')
+f(9,106,1,6,'zio/ZIO$Sync.trace',0,1,0)
+f(9,107,1,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',1,0,0)
+f(10,107,1,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',1,0,0)
+f(11,107,1,2,'java/util/concurrent/ConcurrentLinkedQueue.first',1,0,0)
+f(12,107,1,2,'java/util/concurrent/ConcurrentLinkedQueue.updateHead',1,0,0)
+f(13,107,1,2,'java/lang/invoke/VarHandleGuards.guard_LLL_Z',1,0,0)
+f(14,107,1,2,'java/lang/invoke/VarForm.getMemberName',1,0,0)
+f(15,107,1,2,'java/lang/invoke/VarForm.getMemberNameOrNull',1,0,0)
+f(9,108,373,1,'zio/internal/FiberRuntime.runLoop')
+f(10,108,1,3,'itable stub')
+f(10,109,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply')
+f(11,109,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2')
+f(12,109,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(13,109,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(14,109,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(15,109,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(16,109,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(17,109,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(18,109,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(12,110,1,1,'zio/ZIO$OnSuccess.flatMap')
+f(13,110,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(14,110,1,2,'zio/ZIO.flatMap',1,0,0)
+f(15,110,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(16,110,1,2,'zio/ZIO$OnSuccess.<init>',1,0,0)
+f(10,111,1,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(11,111,1,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(12,111,1,1,'zio/Unsafe$.unsafe')
+f(13,111,1,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d6b608.apply')
+f(14,111,1,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(15,111,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$98.0x0000000800d6f280.apply')
+f(10,112,369,1,'zio/internal/FiberRuntime.runLoop')
+f(11,115,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply',1,0,0)
+f(12,115,5,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',1,0,0)
+f(13,115,1,3,'itable stub')
+f(13,116,4,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(14,116,4,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(15,116,4,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(16,116,3,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(17,116,3,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(18,116,3,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(19,116,3,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(20,116,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(21,116,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(22,116,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(20,117,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(21,117,1,2,'zio/ZIO$Sync.flatMap',1,0,0)
+f(22,117,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(23,117,1,2,'zio/ZIO.flatMap',1,0,0)
+f(24,117,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(20,118,1,2,'zio/ZIO$.succeed',1,0,0)
+f(21,118,1,2,'zio/ZIOCompanionVersionSpecific.succeed$',1,0,0)
+f(22,118,1,2,'zio/ZIOCompanionVersionSpecific.succeed',1,0,0)
+f(23,118,1,2,'zio/ZIO$Sync$.apply',1,0,0)
+f(16,119,1,2,'zio/ZIO$OnSuccess.flatMap',1,0,0)
+f(17,119,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(18,119,1,2,'zio/ZIO.flatMap',1,0,0)
+f(19,119,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(11,120,1,6,'zio/ZIO$OnSuccess.trace',0,1,0)
+f(11,121,360,1,'zio/internal/FiberRuntime.runLoop')
+f(12,124,2,3,'itable stub')
+f(12,126,3,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply',2,0,0)
+f(13,126,3,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',2,0,0)
+f(14,126,1,3,'itable stub')
+f(14,127,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(15,127,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(14,128,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(15,128,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(16,128,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(17,128,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(18,128,1,2,'zio/ZIO$Sync.flatMap',1,0,0)
+f(19,128,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(20,128,1,2,'zio/ZIO.flatMap',1,0,0)
+f(21,128,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(12,129,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$97.0x0000000800d6eeb0.apply')
+f(13,129,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1')
+f(14,129,1,1,'zio/ZIO$.succeed')
+f(15,129,1,1,'zio/ZIOCompanionVersionSpecific.succeed$')
+f(16,129,1,1,'zio/ZIOCompanionVersionSpecific.succeed')
+f(17,129,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(18,129,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(19,129,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(12,130,1,6,'zio/ZIO$Sync.trace',0,1,0)
+f(12,131,2,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',2,0,0)
+f(12,133,348,1,'zio/internal/FiberRuntime.runLoop')
+f(13,137,5,3,'itable stub')
+f(13,142,5,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply',3,0,0)
+f(14,142,5,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',3,0,0)
+f(15,142,2,3,'itable stub')
+f(15,144,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(16,144,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(15,145,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(15,146,1,1,'zio/ZIO$OnSuccess.flatMap')
+f(13,147,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$97.0x0000000800d6eeb0.apply')
+f(14,147,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1')
+f(15,147,1,1,'zio/ZIO$.succeed')
+f(16,147,1,1,'zio/ZIOCompanionVersionSpecific.succeed$')
+f(17,147,1,1,'zio/ZIOCompanionVersionSpecific.succeed')
+f(18,147,1,2,'zio/ZIO$Sync$.apply',1,0,0)
+f(13,148,6,2,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply',2,0,0)
+f(14,149,5,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1',1,0,0)
+f(15,149,1,1,'zio/Unsafe$.implicitFunctionIsFunction')
+f(16,149,1,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$')
+f(17,149,1,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction')
+f(18,149,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(19,149,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(20,149,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(15,150,4,1,'zio/Unsafe$.unsafe',1,0,0)
+f(16,151,3,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d6b608.apply')
+f(17,152,2,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1')
+f(18,152,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$98.0x0000000800d6f280.apply')
+f(13,154,1,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',1,0,0)
+f(14,154,1,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',1,0,0)
+f(15,154,1,2,'java/util/concurrent/ConcurrentLinkedQueue.first',1,0,0)
+f(16,154,1,2,'java/util/concurrent/ConcurrentLinkedQueue.updateHead',1,0,0)
+f(17,154,1,2,'java/lang/invoke/VarHandleGuards.guard_LL_V',1,0,0)
+f(18,154,1,2,'java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.setRelease',1,0,0)
+f(13,155,326,1,'zio/internal/FiberRuntime.runLoop')
+f(14,167,3,3,'itable stub')
+f(14,170,7,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply',3,0,0)
+f(15,170,7,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',3,0,0)
+f(16,170,3,3,'itable stub')
+f(16,173,4,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(17,173,4,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(18,173,2,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',2,0,0)
+f(19,173,2,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',2,0,0)
+f(20,173,2,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',2,0,0)
+f(18,175,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(19,175,1,2,'zio/ZIO$Sync.flatMap',1,0,0)
+f(20,175,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(21,175,1,2,'zio/ZIO.flatMap',1,0,0)
+f(22,175,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(18,176,1,2,'zio/ZIO$Sync.flatMap',1,0,0)
+f(19,176,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(20,176,1,2,'zio/ZIO.flatMap',1,0,0)
+f(21,176,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(22,176,1,2,'zio/ZIO$OnSuccess.<init>',1,0,0)
+f(14,177,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$97.0x0000000800d6eeb0.apply')
+f(15,177,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1')
+f(16,177,1,1,'zio/ZIO$.succeed')
+f(17,177,1,1,'zio/ZIOCompanionVersionSpecific.succeed$')
+f(18,177,1,1,'zio/ZIOCompanionVersionSpecific.succeed')
+f(14,178,1,6,'zio/ZIO$Sync.trace',0,1,0)
+f(14,179,8,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(15,179,8,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(16,179,2,1,'zio/Unsafe$.implicitFunctionIsFunction')
+f(17,179,2,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$')
+f(18,179,2,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction')
+f(16,181,6,1,'zio/Unsafe$.unsafe')
+f(17,181,6,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d6b608.apply')
+f(18,183,4,2,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1',2,0,0)
+f(19,183,2,3,'itable stub')
+f(19,185,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$98.0x0000000800d6f280.apply')
+f(14,187,4,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',4,0,0)
+f(15,187,4,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',4,0,0)
+f(16,187,4,2,'java/util/concurrent/ConcurrentLinkedQueue.first',4,0,0)
+f(17,187,4,2,'java/util/concurrent/ConcurrentLinkedQueue.updateHead',4,0,0)
+f(18,187,3,2,'java/lang/invoke/VarHandleGuards.guard_LLL_Z',3,0,0)
+f(19,187,1,2,'java/lang/invoke/VarForm.getMemberName',1,0,0)
+f(20,187,1,2,'java/lang/invoke/VarForm.getMemberNameOrNull',1,0,0)
+f(19,188,2,2,'java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.compareAndSet',2,0,0)
+f(20,188,2,2,'java/util/Objects.requireNonNull',2,0,0)
+f(18,190,1,2,'java/lang/invoke/VarHandleGuards.guard_LL_V',1,0,0)
+f(19,190,1,2,'java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.setRelease',1,0,0)
+f(14,191,290,1,'zio/internal/FiberRuntime.runLoop')
+f(15,201,8,3,'itable stub')
+f(15,209,20,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply',15,0,0)
+f(16,209,20,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',15,0,0)
+f(17,212,10,3,'itable stub')
+f(17,222,2,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',2,0,0)
+f(18,222,2,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',2,0,0)
+f(17,224,5,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(18,224,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(19,224,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(20,224,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(18,225,3,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(19,225,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(20,225,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(21,225,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(19,226,2,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(20,226,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(21,226,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(22,226,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(20,227,1,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(21,227,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(22,227,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(23,227,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(18,228,1,2,'zio/ZIO$OnSuccess.flatMap',1,0,0)
+f(19,228,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(20,228,1,2,'zio/ZIO.flatMap',1,0,0)
+f(21,228,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(15,229,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$97.0x0000000800d6eeb0.apply')
+f(16,229,5,1,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1')
+f(17,229,5,1,'zio/ZIO$.succeed')
+f(18,229,5,1,'zio/ZIOCompanionVersionSpecific.succeed$')
+f(19,229,5,1,'zio/ZIOCompanionVersionSpecific.succeed')
+f(20,230,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(21,230,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(22,230,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(20,231,3,2,'zio/ZIO$Sync$.apply',3,0,0)
+f(15,234,2,6,'zio/ZIO$OnSuccess.trace',0,2,0)
+f(15,236,1,6,'zio/ZIO$Sync.trace',0,1,0)
+f(15,237,9,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(16,237,9,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(17,237,1,1,'zio/Unsafe$.implicitFunctionIsFunction')
+f(18,237,1,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$')
+f(19,237,1,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction')
+f(17,238,8,1,'zio/Unsafe$.unsafe')
+f(18,238,8,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d6b608.apply')
+f(19,239,7,2,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1',4,0,0)
+f(20,240,3,3,'itable stub')
+f(20,243,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d6bbd8.apply')
+f(20,244,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$98.0x0000000800d6f280.apply')
+f(15,246,7,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',7,0,0)
+f(16,248,5,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',5,0,0)
+f(17,249,4,2,'java/util/concurrent/ConcurrentLinkedQueue.first',4,0,0)
+f(18,249,4,2,'java/util/concurrent/ConcurrentLinkedQueue.updateHead',4,0,0)
+f(19,249,1,2,'java/lang/invoke/VarHandleGuards.guard_LLL_Z',1,0,0)
+f(20,249,1,2,'java/lang/invoke/VarForm.getMemberName',1,0,0)
+f(21,249,1,2,'java/lang/invoke/VarForm.getMemberNameOrNull',1,0,0)
+f(19,250,3,2,'java/lang/invoke/VarHandleGuards.guard_LL_V',3,0,0)
+f(20,250,3,2,'java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.setRelease',3,0,0)
+f(15,253,228,1,'zio/internal/FiberRuntime.runLoop')
+f(16,258,20,3,'itable stub')
+f(16,278,17,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply',12,0,0)
+f(17,278,17,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',12,0,0)
+f(18,279,9,3,'itable stub')
+f(18,288,2,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',2,0,0)
+f(19,288,2,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',2,0,0)
+f(18,290,3,1,'kyo/bench/BroadFlatMapBench.zioFib$1')
+f(19,290,3,2,'zio/ZIO$.succeed',3,0,0)
+f(20,290,3,2,'zio/ZIOCompanionVersionSpecific.succeed$',3,0,0)
+f(21,290,3,2,'zio/ZIOCompanionVersionSpecific.succeed',3,0,0)
+f(22,290,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(23,290,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(24,290,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(22,291,2,2,'zio/ZIO$Sync$.apply',2,0,0)
+f(18,293,2,1,'zio/ZIO$Sync.flatMap')
+f(19,294,1,2,'zio/ZIO.flatMap$',1,0,0)
+f(20,294,1,2,'zio/ZIO.flatMap',1,0,0)
+f(21,294,1,2,'zio/ZIO$OnSuccess$.apply',1,0,0)
+f(22,294,1,2,'zio/ZIO$OnSuccess.<init>',1,0,0)
+f(16,295,2,2,'kyo/bench/BroadFlatMapBench$$Lambda$97.0x0000000800d6eeb0.apply',1,0,0)
+f(17,295,2,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1',1,0,0)
+f(18,295,2,2,'zio/ZIO$.succeed',1,0,0)
+f(19,295,2,2,'zio/ZIOCompanionVersionSpecific.succeed$',1,0,0)
+f(20,296,1,1,'zio/ZIOCompanionVersionSpecific.succeed')
+f(16,297,9,6,'zio/ZIO$OnSuccess.trace',0,9,0)
+f(16,306,4,6,'zio/ZIO$Sync.trace',0,4,0)
+f(16,310,10,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply',3,0,0)
+f(17,311,9,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1',2,0,0)
+f(18,311,2,2,'zio/Unsafe$.implicitFunctionIsFunction',1,0,0)
+f(19,311,2,2,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$',1,0,0)
+f(20,312,1,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction')
+f(18,313,7,1,'zio/Unsafe$.unsafe',1,0,0)
+f(19,314,6,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d6b608.apply')
+f(20,314,6,2,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1',3,0,0)
+f(21,315,2,3,'itable stub')
+f(21,317,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$98.0x0000000800d6f280.apply')
+f(22,319,1,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2$$anonfun$1$$anonfun$1',1,0,0)
+f(23,319,1,2,'scala/math/BigInt.$plus',1,0,0)
+f(24,319,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(16,320,12,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',12,0,0)
+f(17,322,10,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',10,0,0)
+f(18,322,10,2,'java/util/concurrent/ConcurrentLinkedQueue.first',10,0,0)
+f(19,322,10,2,'java/util/concurrent/ConcurrentLinkedQueue.updateHead',10,0,0)
+f(20,322,7,2,'java/lang/invoke/VarHandleGuards.guard_LLL_Z',7,0,0)
+f(21,322,6,2,'java/lang/invoke/VarForm.getMemberName',6,0,0)
+f(22,323,5,2,'java/lang/invoke/VarForm.getMemberNameOrNull',5,0,0)
+f(21,328,1,2,'java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.compareAndSet',1,0,0)
+f(20,329,3,2,'java/lang/invoke/VarHandleGuards.guard_LL_V',3,0,0)
+f(21,329,3,2,'java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.setRelease',3,0,0)
+f(16,332,149,1,'zio/internal/FiberRuntime.runLoop')
+f(17,342,17,3,'itable stub')
+f(17,359,6,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply',4,0,0)
+f(18,359,6,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',4,0,0)
+f(19,359,3,3,'itable stub')
+f(19,362,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(20,362,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(19,363,2,1,'zio/ZIO$Sync.flatMap')
+f(17,365,5,6,'zio/ZIO$OnSuccess.trace',0,5,0)
+f(17,370,5,6,'zio/ZIO$Sync.trace',0,5,0)
+f(17,375,17,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(18,375,17,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(19,375,3,1,'zio/Unsafe$.implicitFunctionIsFunction')
+f(20,375,3,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$')
+f(21,375,3,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction')
+f(22,376,2,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',2,0,0)
+f(23,376,2,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',2,0,0)
+f(24,376,2,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',2,0,0)
+f(19,378,14,1,'zio/Unsafe$.unsafe')
+f(20,378,14,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d6b608.apply')
+f(21,378,14,2,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1',8,0,0)
+f(22,378,7,3,'itable stub')
+f(22,385,4,1,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d6bbd8.apply')
+f(23,388,1,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$1',1,0,0)
+f(24,388,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(22,389,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$98.0x0000000800d6f280.apply')
+f(22,391,1,2,'zio/UnsafeVersionSpecific.given_Unsafe$1',1,0,0)
+f(17,392,10,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',10,0,0)
+f(18,393,9,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',9,0,0)
+f(19,394,8,2,'java/util/concurrent/ConcurrentLinkedQueue.first',8,0,0)
+f(20,394,8,2,'java/util/concurrent/ConcurrentLinkedQueue.updateHead',8,0,0)
+f(21,394,6,2,'java/lang/invoke/VarHandleGuards.guard_LLL_Z',6,0,0)
+f(22,394,5,2,'java/lang/invoke/VarForm.getMemberName',5,0,0)
+f(23,394,5,2,'java/lang/invoke/VarForm.getMemberNameOrNull',5,0,0)
+f(22,399,1,2,'java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.compareAndSet',1,0,0)
+f(21,400,2,2,'java/lang/invoke/VarHandleGuards.guard_LL_V',2,0,0)
+f(22,400,2,2,'java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.setRelease',2,0,0)
+f(17,402,79,1,'zio/internal/FiberRuntime.runLoop')
+f(18,414,10,3,'itable stub')
+f(18,424,4,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply',3,0,0)
+f(19,424,4,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',3,0,0)
+f(20,425,1,3,'itable stub')
+f(20,426,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(21,426,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(20,427,1,1,'zio/ZIO$Sync.flatMap')
+f(18,428,5,6,'zio/ZIO$Sync.trace',0,5,0)
+f(18,433,18,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply',2,0,0)
+f(19,433,18,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1',2,0,0)
+f(20,433,6,2,'zio/Unsafe$.implicitFunctionIsFunction',2,0,0)
+f(21,433,6,2,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$',2,0,0)
+f(22,435,4,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction')
+f(23,435,4,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',4,0,0)
+f(24,435,4,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',4,0,0)
+f(25,435,4,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',4,0,0)
+f(20,439,12,1,'zio/Unsafe$.unsafe')
+f(21,439,12,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d6b608.apply')
+f(22,440,11,2,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1',7,0,0)
+f(23,440,7,3,'itable stub')
+f(23,447,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d6bbd8.apply')
+f(24,448,1,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$1',1,0,0)
+f(25,448,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(23,449,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$98.0x0000000800d6f280.apply')
+f(18,451,7,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',7,0,0)
+f(19,455,3,2,'java/util/concurrent/ConcurrentLinkedQueue.isEmpty',3,0,0)
+f(20,455,3,2,'java/util/concurrent/ConcurrentLinkedQueue.first',3,0,0)
+f(21,455,3,2,'java/util/concurrent/ConcurrentLinkedQueue.updateHead',3,0,0)
+f(22,455,3,2,'java/lang/invoke/VarHandleGuards.guard_LLL_Z',3,0,0)
+f(23,455,3,2,'java/lang/invoke/VarForm.getMemberName',3,0,0)
+f(24,455,3,2,'java/lang/invoke/VarForm.getMemberNameOrNull',3,0,0)
+f(18,458,23,1,'zio/internal/FiberRuntime.runLoop')
+f(19,461,4,3,'itable stub')
+f(19,465,1,2,'kyo/bench/BroadFlatMapBench$$Lambda$95.0x0000000800d6e000.apply',1,0,0)
+f(20,465,1,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$2',1,0,0)
+f(21,465,1,3,'itable stub')
+f(19,466,2,6,'zio/ZIO$Sync.trace',0,2,0)
+f(19,468,8,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply',1,0,0)
+f(20,468,8,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1',1,0,0)
+f(21,468,8,1,'zio/Unsafe$.unsafe',1,0,0)
+f(22,469,7,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d6b608.apply')
+f(23,470,6,2,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1',3,0,0)
+f(24,471,2,3,'itable stub')
+f(24,473,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$94.0x0000000800d6bbd8.apply')
+f(25,475,1,2,'kyo/bench/BroadFlatMapBench.zioFib$1$$anonfun$1',1,0,0)
+f(26,475,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(19,476,1,2,'zio/internal/FiberRuntime.drainQueueWhileRunning',1,0,0)
+f(19,477,4,1,'zio/internal/FiberRuntime.runLoop')
+f(20,477,1,3,'itable stub')
+f(20,478,3,1,'zio/ZIOCompanionVersionSpecific$$Lambda$69.0x0000000800d14800.apply')
+f(21,478,3,1,'zio/ZIOCompanionVersionSpecific.succeed$$anonfun$1')
+f(22,478,1,1,'zio/Unsafe$.implicitFunctionIsFunction')
+f(23,478,1,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$')
+f(24,478,1,1,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction')
+f(25,478,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(26,478,1,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',1,0,0)
+f(27,478,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(22,479,2,1,'zio/Unsafe$.unsafe')
+f(23,479,2,1,'zio/UnsafeVersionSpecific$$Lambda$93.0x0000000800d6b608.apply')
+f(24,479,2,2,'zio/UnsafeVersionSpecific.implicitFunctionIsFunction$$anonfun$1',2,0,0)
+f(25,479,2,3,'itable stub')
+f(6,481,3,1,'zio/internal/FiberRuntime.setExitValue')
+f(7,481,3,1,'scala/runtime/function/JProcedure1.apply')
+f(8,481,3,1,'scala/runtime/function/JProcedure1.apply')
+f(9,481,3,1,'zio/Runtime$$Lambda$96.0x0000000800d6eaa8.applyVoid')
+f(10,481,3,1,'zio/Runtime.run$$anonfun$2$$anonfun$1')
+f(11,481,3,1,'zio/internal/OneShot.set')
+f(12,481,3,1,'java/lang/Object.notifyAll')
+f(13,482,2,3,'JVM_MonitorNotifyAll')
+f(14,482,2,4,'ObjectMonitor::notifyAll(JavaThread*)')
+f(15,482,1,4,'AccessInternal::PostRuntimeDispatch<G1BarrierSet::AccessBarrier<548964ul, G1BarrierSet>, (AccessInternal::BarrierType)2, 548964ul>::oop_access_barrier(void*)')
+f(15,483,1,4,'ObjectMonitor::INotify(JavaThread*)')
+f(2,484,2,2,'zio/internal/LinkedQueue.poll',2,0,0)
+f(3,484,2,2,'java/util/concurrent/ConcurrentLinkedQueue.poll',2,0,0)
+f(4,484,2,2,'java/util/concurrent/ConcurrentLinkedQueue.updateHead',2,0,0)
+f(5,484,1,5,'asm_sysvec_hyperv_callback')
+f(6,484,1,5,'sysvec_hyperv_callback')
+f(7,484,1,5,'irq_exit_rcu')
+f(8,484,1,5,'__irq_exit_rcu')
+f(9,484,1,5,'__softirqentry_text_start')
+f(5,485,1,2,'java/lang/invoke/VarHandleGuards.guard_LL_V',1,0,0)
+f(6,485,1,2,'java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.setRelease',1,0,0)
+
+search();
+</script></body></html>
