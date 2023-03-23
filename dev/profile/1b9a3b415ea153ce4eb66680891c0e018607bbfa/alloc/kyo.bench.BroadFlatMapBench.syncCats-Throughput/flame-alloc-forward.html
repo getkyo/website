@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 560px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>Allocation profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(35);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,3994,3,'all')
+f(1,0,3547,1,'cats/effect/unsafe/WorkerThread.run')
+f(2,0,3547,1,'cats/effect/IOFiber.run')
+f(3,0,2633,1,'cats/effect/IOFiber.autoCedeR')
+f(4,0,2633,1,'cats/effect/IOFiber.runLoop')
+f(5,0,713,1,'cats/effect/IOFiber.next$2')
+f(6,0,518,1,'kyo/bench/BroadFlatMapBench$$Lambda$40.0x0000000800cbe588.apply')
+f(7,0,518,1,'kyo/bench/BroadFlatMapBench.catsFib$1$$anonfun$1')
+f(8,0,254,1,'cats/effect/IO.flatMap')
+f(9,0,254,1,'cats/effect/IO$FlatMap$.apply')
+f(10,0,254,2,'cats.effect.IO$FlatMap')
+f(8,254,116,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(9,254,116,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(10,254,116,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(11,254,116,2,'kyo.bench.BroadFlatMapBench$$Lambda$96+0x0000000800d59208')
+f(8,370,148,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(9,370,148,1,'cats/effect/IO$.pure')
+f(10,370,148,1,'cats/effect/IO$Pure$.apply')
+f(11,370,148,2,'cats.effect.IO$Pure')
+f(6,518,195,1,'kyo/bench/BroadFlatMapBench$$Lambda$96.0x0000000800d59208.apply')
+f(7,518,195,1,'kyo/bench/BroadFlatMapBench.catsFib$1$$anonfun$1$$anonfun$1')
+f(8,518,195,1,'cats/effect/IO$.pure')
+f(9,518,195,1,'cats/effect/IO$Pure$.apply')
+f(10,518,195,2,'cats.effect.IO$Pure')
+f(5,713,1920,1,'cats/effect/IOFiber.succeeded')
+f(6,713,2,1,'cats/effect/IOFiber.runTerminusSuccessK')
+f(7,713,2,1,'cats/effect/IOFiber.done')
+f(8,713,2,1,'cats/effect/CallbackStack.apply')
+f(9,713,2,1,'scala/runtime/function/JProcedure1.apply')
+f(10,713,2,1,'scala/runtime/function/JProcedure1.apply')
+f(11,713,2,1,'cats/effect/IO$$Lambda$93.0x0000000800d5a000.applyVoid')
+f(12,713,2,1,'cats/effect/IO.$anonfun$6')
+f(13,713,2,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(14,713,2,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(15,713,2,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(16,713,1,2,'cats.effect.IO$$Lambda$97+0x0000000800d59ad8')
+f(16,714,1,2,'cats.effect.IO$$Lambda$99+0x0000000800d64408')
+f(6,715,1776,1,'kyo/bench/BroadFlatMapBench$$Lambda$40.0x0000000800cbe588.apply')
+f(7,715,1776,1,'kyo/bench/BroadFlatMapBench.catsFib$1$$anonfun$1')
+f(8,715,377,1,'cats/effect/IO.flatMap')
+f(9,715,377,1,'cats/effect/IO$FlatMap$.apply')
+f(10,715,377,2,'cats.effect.IO$FlatMap')
+f(8,1092,218,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(9,1092,218,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(10,1092,218,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(11,1092,218,2,'kyo.bench.BroadFlatMapBench$$Lambda$96+0x0000000800d59208')
+f(8,1310,1181,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(9,1310,86,1,'cats/effect/IO$.pure')
+f(10,1310,86,1,'cats/effect/IO$Pure$.apply')
+f(11,1310,86,2,'cats.effect.IO$Pure')
+f(9,1396,208,1,'cats/effect/IO.flatMap')
+f(10,1396,208,1,'cats/effect/IO$FlatMap$.apply')
+f(11,1396,208,2,'cats.effect.IO$FlatMap')
+f(9,1604,167,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(10,1604,167,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(11,1604,167,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(12,1604,167,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(9,1771,720,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(10,1771,63,1,'cats/effect/IO$.pure')
+f(11,1771,63,1,'cats/effect/IO$Pure$.apply')
+f(12,1771,63,2,'cats.effect.IO$Pure')
+f(10,1834,146,1,'cats/effect/IO.flatMap')
+f(11,1834,146,1,'cats/effect/IO$FlatMap$.apply')
+f(12,1834,146,2,'cats.effect.IO$FlatMap')
+f(10,1980,79,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(11,1980,79,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(12,1980,79,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(13,1980,79,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(10,2059,432,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(11,2059,37,1,'cats/effect/IO$.pure')
+f(12,2059,37,1,'cats/effect/IO$Pure$.apply')
+f(13,2059,37,2,'cats.effect.IO$Pure')
+f(11,2096,74,1,'cats/effect/IO.flatMap')
+f(12,2096,74,1,'cats/effect/IO$FlatMap$.apply')
+f(13,2096,74,2,'cats.effect.IO$FlatMap')
+f(11,2170,45,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(12,2170,45,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(13,2170,45,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(14,2170,45,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(11,2215,276,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(12,2215,19,1,'cats/effect/IO$.pure')
+f(13,2215,19,1,'cats/effect/IO$Pure$.apply')
+f(14,2215,19,2,'cats.effect.IO$Pure')
+f(12,2234,55,1,'cats/effect/IO.flatMap')
+f(13,2234,55,1,'cats/effect/IO$FlatMap$.apply')
+f(14,2234,55,2,'cats.effect.IO$FlatMap')
+f(12,2289,47,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(13,2289,47,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(14,2289,47,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(15,2289,47,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(12,2336,155,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(13,2336,11,1,'cats/effect/IO$.pure')
+f(14,2336,11,1,'cats/effect/IO$Pure$.apply')
+f(15,2336,11,2,'cats.effect.IO$Pure')
+f(13,2347,35,1,'cats/effect/IO.flatMap')
+f(14,2347,35,1,'cats/effect/IO$FlatMap$.apply')
+f(15,2347,35,2,'cats.effect.IO$FlatMap')
+f(13,2382,30,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(14,2382,30,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(15,2382,30,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(16,2382,30,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(13,2412,79,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(14,2412,4,1,'cats/effect/IO$.pure')
+f(15,2412,4,1,'cats/effect/IO$Pure$.apply')
+f(16,2412,4,2,'cats.effect.IO$Pure')
+f(14,2416,10,1,'cats/effect/IO.flatMap')
+f(15,2416,10,1,'cats/effect/IO$FlatMap$.apply')
+f(16,2416,10,2,'cats.effect.IO$FlatMap')
+f(14,2426,10,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(15,2426,10,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(16,2426,10,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(17,2426,10,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(14,2436,55,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(15,2436,5,1,'cats/effect/IO$.pure')
+f(16,2436,5,1,'cats/effect/IO$Pure$.apply')
+f(17,2436,5,2,'cats.effect.IO$Pure')
+f(15,2441,14,1,'cats/effect/IO.flatMap')
+f(16,2441,14,1,'cats/effect/IO$FlatMap$.apply')
+f(17,2441,14,2,'cats.effect.IO$FlatMap')
+f(15,2455,10,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(16,2455,10,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(17,2455,10,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(18,2455,10,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(15,2465,26,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(16,2465,3,1,'cats/effect/IO$.pure')
+f(17,2465,3,1,'cats/effect/IO$Pure$.apply')
+f(18,2465,3,2,'cats.effect.IO$Pure')
+f(16,2468,4,1,'cats/effect/IO.flatMap')
+f(17,2468,4,1,'cats/effect/IO$FlatMap$.apply')
+f(18,2468,4,2,'cats.effect.IO$FlatMap')
+f(16,2472,4,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(17,2472,4,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(18,2472,4,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(19,2472,4,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(16,2476,15,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(17,2476,5,1,'cats/effect/IO$.pure')
+f(18,2476,5,1,'cats/effect/IO$Pure$.apply')
+f(19,2476,5,2,'cats.effect.IO$Pure')
+f(17,2481,1,1,'cats/effect/IO.flatMap')
+f(18,2481,1,1,'cats/effect/IO$FlatMap$.apply')
+f(19,2481,1,2,'cats.effect.IO$FlatMap')
+f(17,2482,9,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(18,2482,2,1,'cats/effect/IO$.pure')
+f(19,2482,2,1,'cats/effect/IO$Pure$.apply')
+f(20,2482,2,2,'cats.effect.IO$Pure')
+f(18,2484,3,1,'cats/effect/IO.flatMap')
+f(19,2484,3,1,'cats/effect/IO$FlatMap$.apply')
+f(20,2484,3,2,'cats.effect.IO$FlatMap')
+f(18,2487,4,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(19,2487,3,1,'cats/effect/IO.flatMap')
+f(20,2487,3,1,'cats/effect/IO$FlatMap$.apply')
+f(21,2487,3,2,'cats.effect.IO$FlatMap')
+f(19,2490,1,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(20,2490,1,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(21,2490,1,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(22,2490,1,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(23,2490,1,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(6,2491,142,1,'kyo/bench/BroadFlatMapBench$$Lambda$96.0x0000000800d59208.apply')
+f(7,2491,142,1,'kyo/bench/BroadFlatMapBench.catsFib$1$$anonfun$1$$anonfun$1')
+f(8,2491,142,1,'cats/effect/IO$.pure')
+f(9,2491,142,1,'cats/effect/IO$Pure$.apply')
+f(10,2491,142,2,'cats.effect.IO$Pure')
+f(3,2633,914,1,'cats/effect/IOFiber.execR')
+f(4,2633,1,1,'cats/effect/ArrayStack.init')
+f(5,2633,1,2,'java.lang.Object[]')
+f(4,2634,9,1,'cats/effect/ByteStack$.create')
+f(5,2634,9,2,'int[]')
+f(4,2643,904,1,'cats/effect/IOFiber.runLoop')
+f(5,2643,234,1,'cats/effect/IOFiber.next$2')
+f(6,2643,183,1,'kyo/bench/BroadFlatMapBench$$Lambda$40.0x0000000800cbe588.apply')
+f(7,2643,183,1,'kyo/bench/BroadFlatMapBench.catsFib$1$$anonfun$1')
+f(8,2643,99,1,'cats/effect/IO.flatMap')
+f(9,2643,99,1,'cats/effect/IO$FlatMap$.apply')
+f(10,2643,99,2,'cats.effect.IO$FlatMap')
+f(8,2742,32,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(9,2742,32,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(10,2742,32,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(11,2742,32,2,'kyo.bench.BroadFlatMapBench$$Lambda$96+0x0000000800d59208')
+f(8,2774,52,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(9,2774,52,1,'cats/effect/IO$.pure')
+f(10,2774,52,1,'cats/effect/IO$Pure$.apply')
+f(11,2774,52,2,'cats.effect.IO$Pure')
+f(6,2826,51,1,'kyo/bench/BroadFlatMapBench$$Lambda$96.0x0000000800d59208.apply')
+f(7,2826,51,1,'kyo/bench/BroadFlatMapBench.catsFib$1$$anonfun$1$$anonfun$1')
+f(8,2826,51,1,'cats/effect/IO$.pure')
+f(9,2826,51,1,'cats/effect/IO$Pure$.apply')
+f(10,2826,51,2,'cats.effect.IO$Pure')
+f(5,2877,670,1,'cats/effect/IOFiber.succeeded')
+f(6,2877,617,1,'kyo/bench/BroadFlatMapBench$$Lambda$40.0x0000000800cbe588.apply')
+f(7,2877,617,1,'kyo/bench/BroadFlatMapBench.catsFib$1$$anonfun$1')
+f(8,2877,145,1,'cats/effect/IO.flatMap')
+f(9,2877,145,1,'cats/effect/IO$FlatMap$.apply')
+f(10,2877,145,2,'cats.effect.IO$FlatMap')
+f(8,3022,63,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(9,3022,63,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(10,3022,63,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(11,3022,63,2,'kyo.bench.BroadFlatMapBench$$Lambda$96+0x0000000800d59208')
+f(8,3085,409,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(9,3085,31,1,'cats/effect/IO$.pure')
+f(10,3085,31,1,'cats/effect/IO$Pure$.apply')
+f(11,3085,31,2,'cats.effect.IO$Pure')
+f(9,3116,80,1,'cats/effect/IO.flatMap')
+f(10,3116,80,1,'cats/effect/IO$FlatMap$.apply')
+f(11,3116,80,2,'cats.effect.IO$FlatMap')
+f(9,3196,44,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(10,3196,44,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(11,3196,44,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(12,3196,44,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(9,3240,254,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(10,3240,18,1,'cats/effect/IO$.pure')
+f(11,3240,18,1,'cats/effect/IO$Pure$.apply')
+f(12,3240,18,2,'cats.effect.IO$Pure')
+f(10,3258,48,1,'cats/effect/IO.flatMap')
+f(11,3258,48,1,'cats/effect/IO$FlatMap$.apply')
+f(12,3258,48,2,'cats.effect.IO$FlatMap')
+f(10,3306,31,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(11,3306,31,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(12,3306,31,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(13,3306,31,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(10,3337,157,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(11,3337,11,1,'cats/effect/IO$.pure')
+f(12,3337,11,1,'cats/effect/IO$Pure$.apply')
+f(13,3337,11,2,'cats.effect.IO$Pure')
+f(11,3348,28,1,'cats/effect/IO.flatMap')
+f(12,3348,28,1,'cats/effect/IO$FlatMap$.apply')
+f(13,3348,28,2,'cats.effect.IO$FlatMap')
+f(11,3376,12,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(12,3376,12,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(13,3376,12,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(14,3376,12,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(11,3388,106,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(12,3388,6,1,'cats/effect/IO$.pure')
+f(13,3388,6,1,'cats/effect/IO$Pure$.apply')
+f(14,3388,6,2,'cats.effect.IO$Pure')
+f(12,3394,25,1,'cats/effect/IO.flatMap')
+f(13,3394,25,1,'cats/effect/IO$FlatMap$.apply')
+f(14,3394,25,2,'cats.effect.IO$FlatMap')
+f(12,3419,14,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(13,3419,14,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(14,3419,14,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(15,3419,14,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(12,3433,61,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(13,3433,1,1,'cats/effect/IO$.pure')
+f(14,3433,1,1,'cats/effect/IO$Pure$.apply')
+f(15,3433,1,2,'cats.effect.IO$Pure')
+f(13,3434,10,1,'cats/effect/IO.flatMap')
+f(14,3434,10,1,'cats/effect/IO$FlatMap$.apply')
+f(15,3434,10,2,'cats.effect.IO$FlatMap')
+f(13,3444,11,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(14,3444,11,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(15,3444,11,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(16,3444,11,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(13,3455,39,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(14,3455,4,1,'cats/effect/IO$.pure')
+f(15,3455,4,1,'cats/effect/IO$Pure$.apply')
+f(16,3455,4,2,'cats.effect.IO$Pure')
+f(14,3459,6,1,'cats/effect/IO.flatMap')
+f(15,3459,6,1,'cats/effect/IO$FlatMap$.apply')
+f(16,3459,6,2,'cats.effect.IO$FlatMap')
+f(14,3465,5,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(15,3465,5,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(16,3465,5,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(17,3465,5,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(14,3470,24,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(15,3470,1,1,'cats/effect/IO$.pure')
+f(16,3470,1,1,'cats/effect/IO$Pure$.apply')
+f(17,3470,1,2,'cats.effect.IO$Pure')
+f(15,3471,4,1,'cats/effect/IO.flatMap')
+f(16,3471,4,1,'cats/effect/IO$FlatMap$.apply')
+f(17,3471,4,2,'cats.effect.IO$FlatMap')
+f(15,3475,3,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(16,3475,3,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(17,3475,3,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(18,3475,3,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(15,3478,16,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(16,3478,4,1,'cats/effect/IO$.pure')
+f(17,3478,4,1,'cats/effect/IO$Pure$.apply')
+f(18,3478,4,2,'cats.effect.IO$Pure')
+f(16,3482,2,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(17,3482,2,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(18,3482,2,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(19,3482,2,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(16,3484,10,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(17,3484,2,1,'cats/effect/IO$.pure')
+f(18,3484,2,1,'cats/effect/IO$Pure$.apply')
+f(19,3484,2,2,'cats.effect.IO$Pure')
+f(17,3486,3,1,'cats/effect/IO.flatMap')
+f(18,3486,3,1,'cats/effect/IO$FlatMap$.apply')
+f(19,3486,3,2,'cats.effect.IO$FlatMap')
+f(17,3489,1,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(18,3489,1,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(19,3489,1,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(20,3489,1,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(17,3490,4,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(18,3490,1,1,'cats/effect/IO$.pure')
+f(19,3490,1,1,'cats/effect/IO$Pure$.apply')
+f(20,3490,1,2,'cats.effect.IO$Pure')
+f(18,3491,2,1,'cats/effect/IO.flatMap')
+f(19,3491,2,1,'cats/effect/IO$FlatMap$.apply')
+f(20,3491,2,2,'cats.effect.IO$FlatMap')
+f(18,3493,1,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(19,3493,1,1,'cats/effect/IO$.pure')
+f(20,3493,1,1,'cats/effect/IO$Pure$.apply')
+f(21,3493,1,2,'cats.effect.IO$Pure')
+f(6,3494,53,1,'kyo/bench/BroadFlatMapBench$$Lambda$96.0x0000000800d59208.apply')
+f(7,3494,53,1,'kyo/bench/BroadFlatMapBench.catsFib$1$$anonfun$1$$anonfun$1')
+f(8,3494,53,1,'cats/effect/IO$.pure')
+f(9,3494,53,1,'cats/effect/IO$Pure$.apply')
+f(10,3494,53,2,'cats.effect.IO$Pure')
+f(1,3547,446,1,'java/lang/Thread.run')
+f(2,3547,446,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(3,3547,446,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(4,3547,446,1,'java/util/concurrent/FutureTask.run')
+f(5,3547,446,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(6,3547,446,1,'java/util/concurrent/FutureTask.run')
+f(7,3547,446,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(8,3547,446,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(9,3547,446,1,'java/lang/reflect/Method.invoke')
+f(10,3547,446,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(11,3547,446,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(12,3547,446,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(13,3547,446,1,'kyo/bench/jmh_generated/BroadFlatMapBench_syncCats_jmhTest.syncCats_Throughput')
+f(14,3547,446,1,'kyo/bench/jmh_generated/BroadFlatMapBench_syncCats_jmhTest.syncCats_thrpt_jmhStub')
+f(15,3547,446,1,'kyo/bench/Bench.syncCats')
+f(16,3547,254,1,'cats/effect/IOPlatform.unsafeRunSync')
+f(17,3547,246,1,'cats/effect/IOPlatform.unsafeRunTimed')
+f(18,3547,152,1,'cats/effect/IO.unsafeRunAsync')
+f(19,3547,137,1,'cats/effect/IO.unsafeRunFiber')
+f(20,3547,48,2,'cats.effect.IOFiber')
+f(20,3595,74,1,'cats/effect/IOFiber.<init>')
+f(21,3595,17,1,'cats/effect/ArrayStack$.apply')
+f(22,3595,17,2,'cats.effect.ArrayStack')
+f(21,3612,18,1,'cats/effect/CallbackStack$.apply')
+f(22,3612,18,2,'cats.effect.CallbackStack')
+f(21,3630,16,1,'cats/effect/IO$.async')
+f(22,3630,7,2,'cats.effect.IO$$anon$3')
+f(22,3637,9,1,'cats/effect/IO$IOCont$.apply')
+f(23,3637,9,2,'cats.effect.IO$IOCont')
+f(21,3646,7,1,'cats/effect/IO$.uncancelable')
+f(22,3646,7,1,'cats/effect/IO$Uncancelable$.apply')
+f(23,3646,7,2,'cats.effect.IO$Uncancelable')
+f(21,3653,16,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(22,3653,16,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(23,3653,16,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(24,3653,3,2,'cats.effect.IOFiber$$Lambda$94+0x0000000800d5b538')
+f(24,3656,11,2,'cats.effect.IOFiber$$Lambda$95+0x0000000800d5bb28')
+f(24,3667,2,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(25,3667,2,2,'cats.effect.IOFiber$$Lambda$95+0x0000000800d5bb28')
+f(20,3669,10,1,'cats/effect/unsafe/WorkStealingThreadPool.execute')
+f(21,3669,10,1,'cats/effect/unsafe/WorkStealingThreadPool.scheduleExternal')
+f(22,3669,10,1,'cats/effect/unsafe/ScalQueue.offer')
+f(23,3669,10,1,'java/util/concurrent/ConcurrentLinkedQueue.offer')
+f(24,3669,10,2,'java.util.concurrent.ConcurrentLinkedQueue$Node')
+f(20,3679,5,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(21,3679,5,1,'java/lang/invoke/LambdaForm$DMH.0x0000000800d58c00.newInvokeSpecial')
+f(22,3679,5,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(23,3679,3,2,'cats.effect.IO$$Lambda$93+0x0000000800d5a000')
+f(23,3682,2,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(24,3682,2,2,'cats.effect.IO$$Lambda$93+0x0000000800d5a000')
+f(19,3684,15,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(20,3684,15,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(21,3684,15,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(22,3684,7,2,'cats.effect.IO$$Lambda$90+0x0000000800d5e808')
+f(22,3691,3,2,'cats.effect.IO$$Lambda$91+0x0000000800d5eac8')
+f(22,3694,4,2,'cats.effect.IO$$Lambda$92+0x0000000800d5eed0')
+f(22,3698,1,1,'jdk/internal/misc/Unsafe.allocateInstance')
+f(23,3698,1,2,'cats.effect.IO$$Lambda$90+0x0000000800d5e808')
+f(18,3699,28,2,'java.util.concurrent.ArrayBlockingQueue')
+f(18,3727,4,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(19,3727,4,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(20,3727,4,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(21,3727,4,2,'cats.effect.IOPlatform$$Lambda$89+0x0000000800d5e400')
+f(18,3731,44,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(19,3731,44,1,'java/util/concurrent/ArrayBlockingQueue.<init>')
+f(20,3731,1,2,'java.lang.Object[]')
+f(20,3732,8,2,'java.util.concurrent.locks.ReentrantLock')
+f(20,3740,10,1,'java/util/concurrent/locks/ReentrantLock.<init>')
+f(21,3740,10,2,'java.util.concurrent.locks.ReentrantLock$NonfairSync')
+f(20,3750,25,1,'java/util/concurrent/locks/ReentrantLock.newCondition')
+f(21,3750,25,1,'java/util/concurrent/locks/ReentrantLock$Sync.newCondition')
+f(22,3750,25,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject')
+f(18,3775,6,1,'scala/concurrent/package$.blocking')
+f(19,3775,6,1,'scala/concurrent/BlockContext$DefaultBlockContext$.blockOn')
+f(20,3775,6,1,'cats/effect/IOPlatform$$Lambda$100.0x0000000800d64a10.apply')
+f(21,3775,6,1,'cats/effect/IOPlatform.$anonfun$1')
+f(22,3775,6,1,'java/util/concurrent/ArrayBlockingQueue.poll')
+f(23,3775,6,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject.awaitNanos')
+f(24,3775,6,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionNode')
+f(18,3781,12,1,'scala/util/Either.fold')
+f(19,3781,12,1,'cats/effect/IOPlatform$$Lambda$102.0x0000000800d659a8.apply')
+f(20,3781,12,1,'cats/effect/IOPlatform.unsafeRunTimed$$anonfun$3')
+f(21,3781,12,1,'scala/Some$.apply')
+f(22,3781,12,2,'scala.Some')
+f(17,3793,1,2,'scala.concurrent.duration.package$DurationLong')
+f(17,3794,7,1,'scala/concurrent/duration/package$DurationLong.nanos')
+f(18,3794,7,1,'scala/concurrent/duration/DurationConversions.nanos$')
+f(19,3794,7,1,'scala/concurrent/duration/DurationConversions.nanos')
+f(20,3794,7,1,'scala/concurrent/duration/package$DurationLong.nanoseconds')
+f(21,3794,7,1,'scala/concurrent/duration/DurationConversions.nanoseconds$')
+f(22,3794,7,1,'scala/concurrent/duration/DurationConversions.nanoseconds')
+f(23,3794,7,1,'scala/concurrent/duration/package$DurationLong.durationIn')
+f(24,3794,7,2,'scala.concurrent.duration.FiniteDuration')
+f(16,3801,192,1,'kyo/bench/BroadFlatMapBench.catsBench')
+f(17,3801,192,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(18,3801,9,1,'cats/effect/IO.flatMap')
+f(19,3801,9,1,'cats/effect/IO$FlatMap$.apply')
+f(20,3801,9,2,'cats.effect.IO$FlatMap')
+f(18,3810,4,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(19,3810,4,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(20,3810,4,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(21,3810,4,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(18,3814,179,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(19,3814,6,1,'cats/effect/IO.flatMap')
+f(20,3814,6,1,'cats/effect/IO$FlatMap$.apply')
+f(21,3814,6,2,'cats.effect.IO$FlatMap')
+f(19,3820,8,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(20,3820,8,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(21,3820,8,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(22,3820,8,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(19,3828,165,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(20,3828,4,1,'cats/effect/IO.flatMap')
+f(21,3828,4,1,'cats/effect/IO$FlatMap$.apply')
+f(22,3828,4,2,'cats.effect.IO$FlatMap')
+f(20,3832,10,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(21,3832,10,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(22,3832,10,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(23,3832,10,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(20,3842,151,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(21,3842,9,1,'cats/effect/IO.flatMap')
+f(22,3842,9,1,'cats/effect/IO$FlatMap$.apply')
+f(23,3842,9,2,'cats.effect.IO$FlatMap')
+f(21,3851,3,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(22,3851,3,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(23,3851,3,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(24,3851,3,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(21,3854,139,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(22,3854,10,1,'cats/effect/IO.flatMap')
+f(23,3854,10,1,'cats/effect/IO$FlatMap$.apply')
+f(24,3854,10,2,'cats.effect.IO$FlatMap')
+f(22,3864,1,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(23,3864,1,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(24,3864,1,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(25,3864,1,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(22,3865,128,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(23,3865,15,1,'cats/effect/IO.flatMap')
+f(24,3865,15,1,'cats/effect/IO$FlatMap$.apply')
+f(25,3865,15,2,'cats.effect.IO$FlatMap')
+f(23,3880,2,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(24,3880,2,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(25,3880,2,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(26,3880,2,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(23,3882,111,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(24,3882,7,1,'cats/effect/IO.flatMap')
+f(25,3882,7,1,'cats/effect/IO$FlatMap$.apply')
+f(26,3882,7,2,'cats.effect.IO$FlatMap')
+f(24,3889,2,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(25,3889,2,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(26,3889,2,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(27,3889,2,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(24,3891,102,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(25,3891,8,1,'cats/effect/IO.flatMap')
+f(26,3891,8,1,'cats/effect/IO$FlatMap$.apply')
+f(27,3891,8,2,'cats.effect.IO$FlatMap')
+f(25,3899,3,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(26,3899,3,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(27,3899,3,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(28,3899,3,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(25,3902,91,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(26,3902,7,1,'cats/effect/IO.flatMap')
+f(27,3902,7,1,'cats/effect/IO$FlatMap$.apply')
+f(28,3902,7,2,'cats.effect.IO$FlatMap')
+f(26,3909,4,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(27,3909,4,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(28,3909,4,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(29,3909,4,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(26,3913,80,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(27,3913,10,1,'cats/effect/IO.flatMap')
+f(28,3913,10,1,'cats/effect/IO$FlatMap$.apply')
+f(29,3913,10,2,'cats.effect.IO$FlatMap')
+f(27,3923,5,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(28,3923,5,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(29,3923,5,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(30,3923,5,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(27,3928,65,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(28,3928,4,1,'cats/effect/IO.flatMap')
+f(29,3928,4,1,'cats/effect/IO$FlatMap$.apply')
+f(30,3928,4,2,'cats.effect.IO$FlatMap')
+f(28,3932,18,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(29,3932,18,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(30,3932,18,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(31,3932,18,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(28,3950,43,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(29,3950,6,1,'cats/effect/IO.flatMap')
+f(30,3950,6,1,'cats/effect/IO$FlatMap$.apply')
+f(31,3950,6,2,'cats.effect.IO$FlatMap')
+f(29,3956,7,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(30,3956,7,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(31,3956,7,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(32,3956,7,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(29,3963,30,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(30,3963,10,1,'cats/effect/IO.flatMap')
+f(31,3963,10,1,'cats/effect/IO$FlatMap$.apply')
+f(32,3963,10,2,'cats.effect.IO$FlatMap')
+f(30,3973,5,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(31,3973,5,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(32,3973,5,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(33,3973,5,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(30,3978,15,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(31,3978,8,1,'cats/effect/IO.flatMap')
+f(32,3978,8,1,'cats/effect/IO$FlatMap$.apply')
+f(33,3978,8,2,'cats.effect.IO$FlatMap')
+f(31,3986,5,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(32,3986,5,1,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial')
+f(33,3986,5,1,'java/lang/invoke/DirectMethodHandle.allocateInstance')
+f(34,3986,5,2,'kyo.bench.BroadFlatMapBench$$Lambda$40+0x0000000800cbe588')
+f(31,3991,2,1,'kyo/bench/BroadFlatMapBench.catsFib$1')
+f(32,3991,2,1,'cats/effect/IO$.pure')
+f(33,3991,2,1,'cats/effect/IO$Pure$.apply')
+f(34,3991,2,2,'cats.effect.IO$Pure')
+f(1,3993,1,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(2,3993,1,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(3,3993,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(4,3993,1,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(5,3993,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(6,3993,1,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(7,3993,1,1,'org/openjdk/jmh/runner/BenchmarkHandler.runIteration')
+f(8,3993,1,1,'org/openjdk/jmh/runner/InfraControl.awaitWarmdownReady')
+f(9,3993,1,1,'org/openjdk/jmh/runner/InfraControlL2.awaitWarmdownReady')
+f(10,3993,1,1,'java/util/concurrent/CountDownLatch.await')
+f(11,3993,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireSharedInterruptibly')
+f(12,3993,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(13,3993,1,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode')
+
+search();
+</script></body></html>
