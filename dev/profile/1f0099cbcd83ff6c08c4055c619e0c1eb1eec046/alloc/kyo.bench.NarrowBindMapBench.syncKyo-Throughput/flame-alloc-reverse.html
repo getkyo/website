@@ -1,0 +1,1016 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 560px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>Allocation profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = true;
+	const levels = Array(35);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,57477,3,'all')
+f(1,0,14277,2,'java.lang.Integer')
+f(2,0,14277,1,'java/lang/Integer.valueOf')
+f(3,0,14277,1,'scala/runtime/BoxesRunTime.boxToInteger')
+f(4,0,2579,1,'kyo/bench/NarrowBindMapBench.transformLoop$1$$anonfun$1')
+f(5,0,2579,1,'kyo/bench/NarrowBindMapBench.transformLoop$1$$anonfun$adapted$1')
+f(6,0,2579,1,'kyo/bench/NarrowBindMapBench$$Lambda$40.0x0000000800cd58d8.apply')
+f(7,0,2579,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$_$_$_$transformLoop$1')
+f(8,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$2.apply')
+f(9,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$3.apply')
+f(10,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$4.apply')
+f(11,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$5.apply')
+f(12,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$6.apply')
+f(13,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$7.apply')
+f(14,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(15,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(16,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(17,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(18,0,2579,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(19,0,2579,1,'kyo/bench/Bench.runLoop$1')
+f(20,0,2579,1,'kyo/bench/Bench.syncKyo')
+f(21,0,2579,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(22,0,2579,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(23,0,2579,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(24,0,2579,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(25,0,2579,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(26,0,2579,1,'java/lang/reflect/Method.invoke')
+f(27,0,2579,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(28,0,2579,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(29,0,2579,1,'java/util/concurrent/FutureTask.run')
+f(30,0,2579,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(31,0,2579,1,'java/util/concurrent/FutureTask.run')
+f(32,0,2579,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(33,0,2579,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(34,0,2579,1,'java/lang/Thread.run')
+f(4,2579,598,1,'kyo/bench/NarrowBindMapBench.transformLoop$10$$anonfun$1')
+f(5,2579,598,1,'kyo/bench/NarrowBindMapBench.transformLoop$10$$anonfun$adapted$1')
+f(6,2579,598,1,'kyo/bench/NarrowBindMapBench$$Lambda$49.0x0000000800cd7ae0.apply')
+f(7,2579,598,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$transformLoop$10')
+f(8,2579,598,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(9,2579,598,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(10,2579,598,1,'kyo/bench/Bench.runLoop$1')
+f(11,2579,598,1,'kyo/bench/Bench.syncKyo')
+f(12,2579,598,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(13,2579,598,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(14,2579,598,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(15,2579,598,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(16,2579,598,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(17,2579,598,1,'java/lang/reflect/Method.invoke')
+f(18,2579,598,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,2579,598,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(20,2579,598,1,'java/util/concurrent/FutureTask.run')
+f(21,2579,598,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(22,2579,598,1,'java/util/concurrent/FutureTask.run')
+f(23,2579,598,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(24,2579,598,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(25,2579,598,1,'java/lang/Thread.run')
+f(4,3177,947,1,'kyo/bench/NarrowBindMapBench.transformLoop$2$$anonfun$1')
+f(5,3177,947,1,'kyo/bench/NarrowBindMapBench.transformLoop$2$$anonfun$adapted$1')
+f(6,3177,947,1,'kyo/bench/NarrowBindMapBench$$Lambda$41.0x0000000800cd5ca0.apply')
+f(7,3177,947,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$_$_$transformLoop$2')
+f(8,3177,947,1,'kyo/bench/NarrowBindMapBench$$anon$3.apply')
+f(9,3177,947,1,'kyo/bench/NarrowBindMapBench$$anon$4.apply')
+f(10,3177,947,1,'kyo/bench/NarrowBindMapBench$$anon$5.apply')
+f(11,3177,947,1,'kyo/bench/NarrowBindMapBench$$anon$6.apply')
+f(12,3177,947,1,'kyo/bench/NarrowBindMapBench$$anon$7.apply')
+f(13,3177,947,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(14,3177,947,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(15,3177,947,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(16,3177,947,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(17,3177,947,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(18,3177,947,1,'kyo/bench/Bench.runLoop$1')
+f(19,3177,947,1,'kyo/bench/Bench.syncKyo')
+f(20,3177,947,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(21,3177,947,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(22,3177,947,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(23,3177,947,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(24,3177,947,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(25,3177,947,1,'java/lang/reflect/Method.invoke')
+f(26,3177,947,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,3177,947,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(28,3177,947,1,'java/util/concurrent/FutureTask.run')
+f(29,3177,947,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(30,3177,947,1,'java/util/concurrent/FutureTask.run')
+f(31,3177,947,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(32,3177,947,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(33,3177,947,1,'java/lang/Thread.run')
+f(4,4124,2019,1,'kyo/bench/NarrowBindMapBench.transformLoop$3$$anonfun$1')
+f(5,4124,2019,1,'kyo/bench/NarrowBindMapBench.transformLoop$3$$anonfun$adapted$1')
+f(6,4124,2019,1,'kyo/bench/NarrowBindMapBench$$Lambda$42.0x0000000800cd6068.apply')
+f(7,4124,2019,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$_$transformLoop$3')
+f(8,4124,2019,1,'kyo/bench/NarrowBindMapBench$$anon$4.apply')
+f(9,4124,2019,1,'kyo/bench/NarrowBindMapBench$$anon$5.apply')
+f(10,4124,2019,1,'kyo/bench/NarrowBindMapBench$$anon$6.apply')
+f(11,4124,2019,1,'kyo/bench/NarrowBindMapBench$$anon$7.apply')
+f(12,4124,2019,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(13,4124,2019,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(14,4124,2019,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(15,4124,2019,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(16,4124,2019,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(17,4124,2019,1,'kyo/bench/Bench.runLoop$1')
+f(18,4124,2019,1,'kyo/bench/Bench.syncKyo')
+f(19,4124,2019,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(20,4124,2019,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(21,4124,2019,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(22,4124,2019,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(23,4124,2019,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(24,4124,2019,1,'java/lang/reflect/Method.invoke')
+f(25,4124,2019,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,4124,2019,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,4124,2019,1,'java/util/concurrent/FutureTask.run')
+f(28,4124,2019,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(29,4124,2019,1,'java/util/concurrent/FutureTask.run')
+f(30,4124,2019,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(31,4124,2019,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(32,4124,2019,1,'java/lang/Thread.run')
+f(4,6143,366,1,'kyo/bench/NarrowBindMapBench.transformLoop$4$$anonfun$1')
+f(5,6143,366,1,'kyo/bench/NarrowBindMapBench.transformLoop$4$$anonfun$adapted$1')
+f(6,6143,366,1,'kyo/bench/NarrowBindMapBench$$Lambda$43.0x0000000800cd6430.apply')
+f(7,6143,366,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$transformLoop$4')
+f(8,6143,366,1,'kyo/bench/NarrowBindMapBench$$anon$5.apply')
+f(9,6143,366,1,'kyo/bench/NarrowBindMapBench$$anon$6.apply')
+f(10,6143,366,1,'kyo/bench/NarrowBindMapBench$$anon$7.apply')
+f(11,6143,366,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(12,6143,366,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(13,6143,366,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(14,6143,366,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(15,6143,366,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(16,6143,366,1,'kyo/bench/Bench.runLoop$1')
+f(17,6143,366,1,'kyo/bench/Bench.syncKyo')
+f(18,6143,366,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(19,6143,366,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(20,6143,366,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(21,6143,366,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(22,6143,366,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(23,6143,366,1,'java/lang/reflect/Method.invoke')
+f(24,6143,366,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(25,6143,366,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,6143,366,1,'java/util/concurrent/FutureTask.run')
+f(27,6143,366,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(28,6143,366,1,'java/util/concurrent/FutureTask.run')
+f(29,6143,366,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(30,6143,366,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(31,6143,366,1,'java/lang/Thread.run')
+f(4,6509,2288,1,'kyo/bench/NarrowBindMapBench.transformLoop$5$$anonfun$1')
+f(5,6509,2288,1,'kyo/bench/NarrowBindMapBench.transformLoop$5$$anonfun$adapted$1')
+f(6,6509,2288,1,'kyo/bench/NarrowBindMapBench$$Lambda$44.0x0000000800cd67f8.apply')
+f(7,6509,2288,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$transformLoop$5')
+f(8,6509,2288,1,'kyo/bench/NarrowBindMapBench$$anon$6.apply')
+f(9,6509,2288,1,'kyo/bench/NarrowBindMapBench$$anon$7.apply')
+f(10,6509,2288,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(11,6509,2288,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(12,6509,2288,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(13,6509,2288,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(14,6509,2288,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(15,6509,2288,1,'kyo/bench/Bench.runLoop$1')
+f(16,6509,2288,1,'kyo/bench/Bench.syncKyo')
+f(17,6509,2288,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(18,6509,2288,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(19,6509,2288,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(20,6509,2288,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(21,6509,2288,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(22,6509,2288,1,'java/lang/reflect/Method.invoke')
+f(23,6509,2288,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(24,6509,2288,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(25,6509,2288,1,'java/util/concurrent/FutureTask.run')
+f(26,6509,2288,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(27,6509,2288,1,'java/util/concurrent/FutureTask.run')
+f(28,6509,2288,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(29,6509,2288,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(30,6509,2288,1,'java/lang/Thread.run')
+f(4,8797,1114,1,'kyo/bench/NarrowBindMapBench.transformLoop$6$$anonfun$1')
+f(5,8797,1114,1,'kyo/bench/NarrowBindMapBench.transformLoop$6$$anonfun$adapted$1')
+f(6,8797,1114,1,'kyo/bench/NarrowBindMapBench$$Lambda$45.0x0000000800cd6bc0.apply')
+f(7,8797,1114,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$transformLoop$6')
+f(8,8797,1114,1,'kyo/bench/NarrowBindMapBench$$anon$7.apply')
+f(9,8797,1114,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(10,8797,1114,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(11,8797,1114,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(12,8797,1114,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(13,8797,1114,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(14,8797,1114,1,'kyo/bench/Bench.runLoop$1')
+f(15,8797,1114,1,'kyo/bench/Bench.syncKyo')
+f(16,8797,1114,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(17,8797,1114,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(18,8797,1114,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(19,8797,1114,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(20,8797,1114,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(21,8797,1114,1,'java/lang/reflect/Method.invoke')
+f(22,8797,1114,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(23,8797,1114,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(24,8797,1114,1,'java/util/concurrent/FutureTask.run')
+f(25,8797,1114,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(26,8797,1114,1,'java/util/concurrent/FutureTask.run')
+f(27,8797,1114,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(28,8797,1114,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(29,8797,1114,1,'java/lang/Thread.run')
+f(4,9911,1903,1,'kyo/bench/NarrowBindMapBench.transformLoop$7$$anonfun$1')
+f(5,9911,1903,1,'kyo/bench/NarrowBindMapBench.transformLoop$7$$anonfun$adapted$1')
+f(6,9911,1903,1,'kyo/bench/NarrowBindMapBench$$Lambda$46.0x0000000800cd6f88.apply')
+f(7,9911,1903,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$transformLoop$7')
+f(8,9911,1903,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(9,9911,1903,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(10,9911,1903,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(11,9911,1903,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(12,9911,1903,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(13,9911,1903,1,'kyo/bench/Bench.runLoop$1')
+f(14,9911,1903,1,'kyo/bench/Bench.syncKyo')
+f(15,9911,1903,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(16,9911,1903,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(17,9911,1903,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(18,9911,1903,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(19,9911,1903,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(20,9911,1903,1,'java/lang/reflect/Method.invoke')
+f(21,9911,1903,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(22,9911,1903,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(23,9911,1903,1,'java/util/concurrent/FutureTask.run')
+f(24,9911,1903,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(25,9911,1903,1,'java/util/concurrent/FutureTask.run')
+f(26,9911,1903,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(27,9911,1903,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(28,9911,1903,1,'java/lang/Thread.run')
+f(4,11814,142,1,'kyo/bench/NarrowBindMapBench.transformLoop$8$$anonfun$1')
+f(5,11814,142,1,'kyo/bench/NarrowBindMapBench.transformLoop$8$$anonfun$adapted$1')
+f(6,11814,142,1,'kyo/bench/NarrowBindMapBench$$Lambda$47.0x0000000800cd7350.apply')
+f(7,11814,142,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$transformLoop$8')
+f(8,11814,142,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(9,11814,142,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(10,11814,142,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(11,11814,142,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(12,11814,142,1,'kyo/bench/Bench.runLoop$1')
+f(13,11814,142,1,'kyo/bench/Bench.syncKyo')
+f(14,11814,142,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(15,11814,142,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(16,11814,142,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(17,11814,142,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(18,11814,142,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(19,11814,142,1,'java/lang/reflect/Method.invoke')
+f(20,11814,142,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(21,11814,142,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(22,11814,142,1,'java/util/concurrent/FutureTask.run')
+f(23,11814,142,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(24,11814,142,1,'java/util/concurrent/FutureTask.run')
+f(25,11814,142,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(26,11814,142,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(27,11814,142,1,'java/lang/Thread.run')
+f(4,11956,2321,1,'kyo/bench/NarrowBindMapBench.transformLoop$9$$anonfun$1')
+f(5,11956,2321,1,'kyo/bench/NarrowBindMapBench.transformLoop$9$$anonfun$adapted$1')
+f(6,11956,2321,1,'kyo/bench/NarrowBindMapBench$$Lambda$48.0x0000000800cd7718.apply')
+f(7,11956,2321,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$transformLoop$9')
+f(8,11956,2321,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(9,11956,2321,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(10,11956,2321,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(11,11956,2321,1,'kyo/bench/Bench.runLoop$1')
+f(12,11956,2321,1,'kyo/bench/Bench.syncKyo')
+f(13,11956,2321,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(14,11956,2321,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(15,11956,2321,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(16,11956,2321,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(17,11956,2321,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(18,11956,2321,1,'java/lang/reflect/Method.invoke')
+f(19,11956,2321,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(20,11956,2321,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(21,11956,2321,1,'java/util/concurrent/FutureTask.run')
+f(22,11956,2321,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(23,11956,2321,1,'java/util/concurrent/FutureTask.run')
+f(24,11956,2321,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(25,11956,2321,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(26,11956,2321,1,'java/lang/Thread.run')
+f(1,14277,5,2,'java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode')
+f(2,14277,5,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(3,14277,5,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireSharedInterruptibly')
+f(4,14277,5,1,'java/util/concurrent/CountDownLatch.await')
+f(5,14277,5,1,'org/openjdk/jmh/runner/InfraControlL2.awaitWarmdownReady')
+f(6,14277,5,1,'org/openjdk/jmh/runner/InfraControl.awaitWarmdownReady')
+f(7,14277,5,1,'org/openjdk/jmh/runner/BenchmarkHandler.runIteration')
+f(8,14277,5,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(9,14277,5,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(10,14277,5,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(11,14277,5,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(12,14277,5,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(13,14277,5,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(1,14282,3350,2,'kyo.bench.NarrowBindMapBench$$anon$10')
+f(2,14282,3350,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$transformLoop$9')
+f(3,14282,3350,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,14282,3349,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,14282,3349,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,14282,3349,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,14282,3349,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,14282,3349,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,14282,3349,1,'kyo/bench/Bench.runLoop$1')
+f(10,14282,3349,1,'kyo/bench/Bench.syncKyo')
+f(11,14282,3349,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,14282,3349,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,14282,3349,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,14282,3349,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,14282,3349,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,14282,3349,1,'java/lang/reflect/Method.invoke')
+f(17,14282,3349,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,14282,3349,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,14282,3349,1,'java/util/concurrent/FutureTask.run')
+f(20,14282,3349,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,14282,3349,1,'java/util/concurrent/FutureTask.run')
+f(22,14282,3349,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,14282,3349,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,14282,3349,1,'java/lang/Thread.run')
+f(4,17631,1,1,'kyo/bench/NarrowBindMapBench.transformLoop$12$$anonfun$1')
+f(5,17631,1,1,'kyo/bench/NarrowBindMapBench.transformLoop$12$$anonfun$adapted$1')
+f(6,17631,1,1,'kyo/bench/NarrowBindMapBench$$Lambda$39.0x0000000800cd3ac0.apply')
+f(7,17631,1,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$12')
+f(8,17631,1,1,'kyo/bench/NarrowBindMapBench$$anon$15.apply')
+f(9,17631,1,1,'kyo/bench/Bench.runLoop$1')
+f(10,17631,1,1,'kyo/bench/Bench.syncKyo')
+f(11,17631,1,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,17631,1,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,17631,1,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,17631,1,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,17631,1,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,17631,1,1,'java/lang/reflect/Method.invoke')
+f(17,17631,1,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,17631,1,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,17631,1,1,'java/util/concurrent/FutureTask.run')
+f(20,17631,1,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,17631,1,1,'java/util/concurrent/FutureTask.run')
+f(22,17631,1,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,17631,1,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,17631,1,1,'java/lang/Thread.run')
+f(1,17632,3110,2,'kyo.bench.NarrowBindMapBench$$anon$11')
+f(2,17632,3110,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$transformLoop$10')
+f(3,17632,3110,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,17632,3110,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,17632,3110,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,17632,3110,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,17632,3110,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,17632,3110,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,17632,3110,1,'kyo/bench/Bench.runLoop$1')
+f(10,17632,3110,1,'kyo/bench/Bench.syncKyo')
+f(11,17632,3110,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,17632,3110,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,17632,3110,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,17632,3110,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,17632,3110,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,17632,3110,1,'java/lang/reflect/Method.invoke')
+f(17,17632,3110,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,17632,3110,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,17632,3110,1,'java/util/concurrent/FutureTask.run')
+f(20,17632,3110,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,17632,3110,1,'java/util/concurrent/FutureTask.run')
+f(22,17632,3110,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,17632,3110,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,17632,3110,1,'java/lang/Thread.run')
+f(1,20742,3992,2,'kyo.bench.NarrowBindMapBench$$anon$12')
+f(2,20742,3992,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(3,20742,3992,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,20742,3992,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,20742,3992,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,20742,3992,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,20742,3992,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,20742,3992,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,20742,3992,1,'kyo/bench/Bench.runLoop$1')
+f(10,20742,3992,1,'kyo/bench/Bench.syncKyo')
+f(11,20742,3992,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,20742,3992,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,20742,3992,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,20742,3992,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,20742,3992,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,20742,3992,1,'java/lang/reflect/Method.invoke')
+f(17,20742,3992,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,20742,3992,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,20742,3992,1,'java/util/concurrent/FutureTask.run')
+f(20,20742,3992,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,20742,3992,1,'java/util/concurrent/FutureTask.run')
+f(22,20742,3992,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,20742,3992,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,20742,3992,1,'java/lang/Thread.run')
+f(1,24734,1,2,'kyo.bench.NarrowBindMapBench$$anon$15')
+f(2,24734,1,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$12')
+f(3,24734,1,1,'kyo/bench/NarrowBindMapBench.kyoBench')
+f(4,24734,1,1,'kyo/bench/Bench.syncKyo')
+f(5,24734,1,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(6,24734,1,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(7,24734,1,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(8,24734,1,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(9,24734,1,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(10,24734,1,1,'java/lang/reflect/Method.invoke')
+f(11,24734,1,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(12,24734,1,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(13,24734,1,1,'java/util/concurrent/FutureTask.run')
+f(14,24734,1,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(15,24734,1,1,'java/util/concurrent/FutureTask.run')
+f(16,24734,1,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(17,24734,1,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(18,24734,1,1,'java/lang/Thread.run')
+f(1,24735,1738,2,'kyo.bench.NarrowBindMapBench$$anon$1')
+f(2,24735,1738,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(3,24735,1738,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(4,24735,1738,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(5,24735,1738,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(6,24735,1738,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(7,24735,1738,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(8,24735,1738,1,'kyo/bench/Bench.runLoop$1')
+f(9,24735,1738,1,'kyo/bench/Bench.syncKyo')
+f(10,24735,1738,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(11,24735,1738,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(12,24735,1738,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(13,24735,1738,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(14,24735,1738,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(15,24735,1738,1,'java/lang/reflect/Method.invoke')
+f(16,24735,1738,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(17,24735,1738,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,24735,1738,1,'java/util/concurrent/FutureTask.run')
+f(19,24735,1738,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(20,24735,1738,1,'java/util/concurrent/FutureTask.run')
+f(21,24735,1738,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(22,24735,1738,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(23,24735,1738,1,'java/lang/Thread.run')
+f(1,26473,3254,2,'kyo.bench.NarrowBindMapBench$$anon$2')
+f(2,26473,3254,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$_$_$_$transformLoop$1')
+f(3,26473,3254,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,26473,3254,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,26473,3254,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,26473,3254,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,26473,3254,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,26473,3254,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,26473,3254,1,'kyo/bench/Bench.runLoop$1')
+f(10,26473,3254,1,'kyo/bench/Bench.syncKyo')
+f(11,26473,3254,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,26473,3254,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,26473,3254,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,26473,3254,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,26473,3254,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,26473,3254,1,'java/lang/reflect/Method.invoke')
+f(17,26473,3254,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,26473,3254,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,26473,3254,1,'java/util/concurrent/FutureTask.run')
+f(20,26473,3254,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,26473,3254,1,'java/util/concurrent/FutureTask.run')
+f(22,26473,3254,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,26473,3254,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,26473,3254,1,'java/lang/Thread.run')
+f(1,29727,2149,2,'kyo.bench.NarrowBindMapBench$$anon$3')
+f(2,29727,2149,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$_$_$transformLoop$2')
+f(3,29727,2149,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,29727,2149,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,29727,2149,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,29727,2149,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,29727,2149,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,29727,2149,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,29727,2149,1,'kyo/bench/Bench.runLoop$1')
+f(10,29727,2149,1,'kyo/bench/Bench.syncKyo')
+f(11,29727,2149,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,29727,2149,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,29727,2149,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,29727,2149,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,29727,2149,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,29727,2149,1,'java/lang/reflect/Method.invoke')
+f(17,29727,2149,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,29727,2149,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,29727,2149,1,'java/util/concurrent/FutureTask.run')
+f(20,29727,2149,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,29727,2149,1,'java/util/concurrent/FutureTask.run')
+f(22,29727,2149,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,29727,2149,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,29727,2149,1,'java/lang/Thread.run')
+f(1,31876,3358,2,'kyo.bench.NarrowBindMapBench$$anon$4')
+f(2,31876,3358,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$_$transformLoop$3')
+f(3,31876,3358,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,31876,3358,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,31876,3358,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,31876,3358,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,31876,3358,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,31876,3358,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,31876,3358,1,'kyo/bench/Bench.runLoop$1')
+f(10,31876,3358,1,'kyo/bench/Bench.syncKyo')
+f(11,31876,3358,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,31876,3358,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,31876,3358,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,31876,3358,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,31876,3358,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,31876,3358,1,'java/lang/reflect/Method.invoke')
+f(17,31876,3358,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,31876,3358,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,31876,3358,1,'java/util/concurrent/FutureTask.run')
+f(20,31876,3358,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,31876,3358,1,'java/util/concurrent/FutureTask.run')
+f(22,31876,3358,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,31876,3358,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,31876,3358,1,'java/lang/Thread.run')
+f(1,35234,3825,2,'kyo.bench.NarrowBindMapBench$$anon$5')
+f(2,35234,3825,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$transformLoop$4')
+f(3,35234,3825,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,35234,3825,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,35234,3825,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,35234,3825,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,35234,3825,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,35234,3825,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,35234,3825,1,'kyo/bench/Bench.runLoop$1')
+f(10,35234,3825,1,'kyo/bench/Bench.syncKyo')
+f(11,35234,3825,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,35234,3825,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,35234,3825,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,35234,3825,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,35234,3825,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,35234,3825,1,'java/lang/reflect/Method.invoke')
+f(17,35234,3825,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,35234,3825,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,35234,3825,1,'java/util/concurrent/FutureTask.run')
+f(20,35234,3825,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,35234,3825,1,'java/util/concurrent/FutureTask.run')
+f(22,35234,3825,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,35234,3825,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,35234,3825,1,'java/lang/Thread.run')
+f(1,39059,3105,2,'kyo.bench.NarrowBindMapBench$$anon$6')
+f(2,39059,3105,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$transformLoop$5')
+f(3,39059,3105,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,39059,3105,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,39059,3105,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,39059,3105,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,39059,3105,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,39059,3105,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,39059,3105,1,'kyo/bench/Bench.runLoop$1')
+f(10,39059,3105,1,'kyo/bench/Bench.syncKyo')
+f(11,39059,3105,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,39059,3105,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,39059,3105,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,39059,3105,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,39059,3105,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,39059,3105,1,'java/lang/reflect/Method.invoke')
+f(17,39059,3105,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,39059,3105,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,39059,3105,1,'java/util/concurrent/FutureTask.run')
+f(20,39059,3105,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,39059,3105,1,'java/util/concurrent/FutureTask.run')
+f(22,39059,3105,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,39059,3105,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,39059,3105,1,'java/lang/Thread.run')
+f(1,42164,3911,2,'kyo.bench.NarrowBindMapBench$$anon$7')
+f(2,42164,3911,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$transformLoop$6')
+f(3,42164,3911,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,42164,3911,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,42164,3911,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,42164,3911,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,42164,3911,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,42164,3911,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,42164,3911,1,'kyo/bench/Bench.runLoop$1')
+f(10,42164,3911,1,'kyo/bench/Bench.syncKyo')
+f(11,42164,3911,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,42164,3911,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,42164,3911,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,42164,3911,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,42164,3911,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,42164,3911,1,'java/lang/reflect/Method.invoke')
+f(17,42164,3911,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,42164,3911,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,42164,3911,1,'java/util/concurrent/FutureTask.run')
+f(20,42164,3911,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,42164,3911,1,'java/util/concurrent/FutureTask.run')
+f(22,42164,3911,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,42164,3911,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,42164,3911,1,'java/lang/Thread.run')
+f(1,46075,3168,2,'kyo.bench.NarrowBindMapBench$$anon$8')
+f(2,46075,3168,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$transformLoop$7')
+f(3,46075,3168,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,46075,3167,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,46075,3167,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,46075,3167,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,46075,3167,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,46075,3167,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,46075,3167,1,'kyo/bench/Bench.runLoop$1')
+f(10,46075,3167,1,'kyo/bench/Bench.syncKyo')
+f(11,46075,3167,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,46075,3167,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,46075,3167,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,46075,3167,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,46075,3167,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,46075,3167,1,'java/lang/reflect/Method.invoke')
+f(17,46075,3167,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,46075,3167,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,46075,3167,1,'java/util/concurrent/FutureTask.run')
+f(20,46075,3167,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,46075,3167,1,'java/util/concurrent/FutureTask.run')
+f(22,46075,3167,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,46075,3167,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,46075,3167,1,'java/lang/Thread.run')
+f(4,49242,1,1,'kyo/bench/NarrowBindMapBench.transformLoop$12$$anonfun$1')
+f(5,49242,1,1,'kyo/bench/NarrowBindMapBench.transformLoop$12$$anonfun$adapted$1')
+f(6,49242,1,1,'kyo/bench/NarrowBindMapBench$$Lambda$39.0x0000000800cd3ac0.apply')
+f(7,49242,1,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$12')
+f(8,49242,1,1,'kyo/bench/NarrowBindMapBench$$anon$15.apply')
+f(9,49242,1,1,'kyo/bench/Bench.runLoop$1')
+f(10,49242,1,1,'kyo/bench/Bench.syncKyo')
+f(11,49242,1,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,49242,1,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,49242,1,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,49242,1,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,49242,1,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,49242,1,1,'java/lang/reflect/Method.invoke')
+f(17,49242,1,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,49242,1,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,49242,1,1,'java/util/concurrent/FutureTask.run')
+f(20,49242,1,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,49242,1,1,'java/util/concurrent/FutureTask.run')
+f(22,49242,1,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,49242,1,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,49242,1,1,'java/lang/Thread.run')
+f(1,49243,2888,2,'kyo.bench.NarrowBindMapBench$$anon$9')
+f(2,49243,2888,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$transformLoop$8')
+f(3,49243,2888,1,'kyo/bench/NarrowBindMapBench.loop$1')
+f(4,49243,2887,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$1')
+f(5,49243,2887,1,'kyo/bench/NarrowBindMapBench.transformLoop$11$$anonfun$adapted$1')
+f(6,49243,2887,1,'kyo/bench/NarrowBindMapBench$$Lambda$50.0x0000000800cd8000.apply')
+f(7,49243,2887,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$11')
+f(8,49243,2887,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(9,49243,2887,1,'kyo/bench/Bench.runLoop$1')
+f(10,49243,2887,1,'kyo/bench/Bench.syncKyo')
+f(11,49243,2887,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,49243,2887,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,49243,2887,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,49243,2887,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,49243,2887,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,49243,2887,1,'java/lang/reflect/Method.invoke')
+f(17,49243,2887,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,49243,2887,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,49243,2887,1,'java/util/concurrent/FutureTask.run')
+f(20,49243,2887,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,49243,2887,1,'java/util/concurrent/FutureTask.run')
+f(22,49243,2887,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,49243,2887,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,49243,2887,1,'java/lang/Thread.run')
+f(4,52130,1,1,'kyo/bench/NarrowBindMapBench.transformLoop$12$$anonfun$1')
+f(5,52130,1,1,'kyo/bench/NarrowBindMapBench.transformLoop$12$$anonfun$adapted$1')
+f(6,52130,1,1,'kyo/bench/NarrowBindMapBench$$Lambda$39.0x0000000800cd3ac0.apply')
+f(7,52130,1,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$transformLoop$12')
+f(8,52130,1,1,'kyo/bench/NarrowBindMapBench$$anon$15.apply')
+f(9,52130,1,1,'kyo/bench/Bench.runLoop$1')
+f(10,52130,1,1,'kyo/bench/Bench.syncKyo')
+f(11,52130,1,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(12,52130,1,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(13,52130,1,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(14,52130,1,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(15,52130,1,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(16,52130,1,1,'java/lang/reflect/Method.invoke')
+f(17,52130,1,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(18,52130,1,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(19,52130,1,1,'java/util/concurrent/FutureTask.run')
+f(20,52130,1,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(21,52130,1,1,'java/util/concurrent/FutureTask.run')
+f(22,52130,1,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(23,52130,1,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(24,52130,1,1,'java/lang/Thread.run')
+f(1,52131,2,2,'org.openjdk.jmh.runner.InfraControl')
+f(2,52131,2,1,'org/openjdk/jmh/runner/BenchmarkHandler.runIteration')
+f(3,52131,2,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(4,52131,2,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmark')
+f(5,52131,2,1,'org/openjdk/jmh/runner/BaseRunner.doSingle')
+f(6,52131,2,1,'org/openjdk/jmh/runner/BaseRunner.runBenchmarksForked')
+f(7,52131,2,1,'org/openjdk/jmh/runner/ForkedRunner.run')
+f(8,52131,2,1,'org/openjdk/jmh/runner/ForkedMain.main')
+f(1,52133,5344,2,'scala.util.NotGiven')
+f(2,52133,5344,1,'scala/util/NotGiven$.value')
+f(3,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$1.apply')
+f(4,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$1.apply')
+f(5,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$2.apply')
+f(6,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$3.apply')
+f(7,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$4.apply')
+f(8,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$5.apply')
+f(9,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$6.apply')
+f(10,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$7.apply')
+f(11,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(12,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(13,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(14,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(15,52133,896,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(16,52133,896,1,'kyo/bench/Bench.runLoop$1')
+f(17,52133,896,1,'kyo/bench/Bench.syncKyo')
+f(18,52133,896,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(19,52133,896,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(20,52133,896,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(21,52133,896,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(22,52133,896,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(23,52133,896,1,'java/lang/reflect/Method.invoke')
+f(24,52133,896,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(25,52133,896,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,52133,896,1,'java/util/concurrent/FutureTask.run')
+f(27,52133,896,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(28,52133,896,1,'java/util/concurrent/FutureTask.run')
+f(29,52133,896,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(30,52133,896,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(31,52133,896,1,'java/lang/Thread.run')
+f(3,53029,1967,1,'kyo/bench/NarrowBindMapBench.transformLoop$1$$anonfun$1')
+f(4,53029,1967,1,'kyo/bench/NarrowBindMapBench.transformLoop$1$$anonfun$adapted$1')
+f(5,53029,1967,1,'kyo/bench/NarrowBindMapBench$$Lambda$40.0x0000000800cd58d8.apply')
+f(6,53029,1967,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$_$_$_$transformLoop$1')
+f(7,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$2.apply')
+f(8,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$3.apply')
+f(9,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$4.apply')
+f(10,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$5.apply')
+f(11,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$6.apply')
+f(12,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$7.apply')
+f(13,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(14,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(15,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(16,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(17,53029,1967,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(18,53029,1967,1,'kyo/bench/Bench.runLoop$1')
+f(19,53029,1967,1,'kyo/bench/Bench.syncKyo')
+f(20,53029,1967,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(21,53029,1967,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(22,53029,1967,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(23,53029,1967,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(24,53029,1967,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(25,53029,1967,1,'java/lang/reflect/Method.invoke')
+f(26,53029,1967,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,53029,1967,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(28,53029,1967,1,'java/util/concurrent/FutureTask.run')
+f(29,53029,1967,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(30,53029,1967,1,'java/util/concurrent/FutureTask.run')
+f(31,53029,1967,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(32,53029,1967,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(33,53029,1967,1,'java/lang/Thread.run')
+f(3,54996,1308,1,'kyo/bench/NarrowBindMapBench.transformLoop$2$$anonfun$1')
+f(4,54996,1308,1,'kyo/bench/NarrowBindMapBench.transformLoop$2$$anonfun$adapted$1')
+f(5,54996,1308,1,'kyo/bench/NarrowBindMapBench$$Lambda$41.0x0000000800cd5ca0.apply')
+f(6,54996,1308,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$_$_$transformLoop$2')
+f(7,54996,1308,1,'kyo/bench/NarrowBindMapBench$$anon$3.apply')
+f(8,54996,1308,1,'kyo/bench/NarrowBindMapBench$$anon$4.apply')
+f(9,54996,1308,1,'kyo/bench/NarrowBindMapBench$$anon$5.apply')
+f(10,54996,1308,1,'kyo/bench/NarrowBindMapBench$$anon$6.apply')
+f(11,54996,1308,1,'kyo/bench/NarrowBindMapBench$$anon$7.apply')
+f(12,54996,1308,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(13,54996,1308,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(14,54996,1308,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(15,54996,1308,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(16,54996,1308,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(17,54996,1308,1,'kyo/bench/Bench.runLoop$1')
+f(18,54996,1308,1,'kyo/bench/Bench.syncKyo')
+f(19,54996,1308,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(20,54996,1308,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(21,54996,1308,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(22,54996,1308,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(23,54996,1308,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(24,54996,1308,1,'java/lang/reflect/Method.invoke')
+f(25,54996,1308,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,54996,1308,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(27,54996,1308,1,'java/util/concurrent/FutureTask.run')
+f(28,54996,1308,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(29,54996,1308,1,'java/util/concurrent/FutureTask.run')
+f(30,54996,1308,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(31,54996,1308,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(32,54996,1308,1,'java/lang/Thread.run')
+f(3,56304,1173,1,'kyo/bench/NarrowBindMapBench.transformLoop$3$$anonfun$1')
+f(4,56304,1173,1,'kyo/bench/NarrowBindMapBench.transformLoop$3$$anonfun$adapted$1')
+f(5,56304,1173,1,'kyo/bench/NarrowBindMapBench$$Lambda$42.0x0000000800cd6068.apply')
+f(6,56304,1173,1,'kyo/bench/NarrowBindMapBench.kyo$bench$NarrowBindMapBench$$_$_$_$_$_$_$_$_$_$transformLoop$3')
+f(7,56304,1173,1,'kyo/bench/NarrowBindMapBench$$anon$4.apply')
+f(8,56304,1173,1,'kyo/bench/NarrowBindMapBench$$anon$5.apply')
+f(9,56304,1173,1,'kyo/bench/NarrowBindMapBench$$anon$6.apply')
+f(10,56304,1173,1,'kyo/bench/NarrowBindMapBench$$anon$7.apply')
+f(11,56304,1173,1,'kyo/bench/NarrowBindMapBench$$anon$8.apply')
+f(12,56304,1173,1,'kyo/bench/NarrowBindMapBench$$anon$9.apply')
+f(13,56304,1173,1,'kyo/bench/NarrowBindMapBench$$anon$10.apply')
+f(14,56304,1173,1,'kyo/bench/NarrowBindMapBench$$anon$11.apply')
+f(15,56304,1173,1,'kyo/bench/NarrowBindMapBench$$anon$12.apply')
+f(16,56304,1173,1,'kyo/bench/Bench.runLoop$1')
+f(17,56304,1173,1,'kyo/bench/Bench.syncKyo')
+f(18,56304,1173,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_thrpt_jmhStub')
+f(19,56304,1173,1,'kyo/bench/jmh_generated/NarrowBindMapBench_syncKyo_jmhTest.syncKyo_Throughput')
+f(20,56304,1173,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(21,56304,1173,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(22,56304,1173,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(23,56304,1173,1,'java/lang/reflect/Method.invoke')
+f(24,56304,1173,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(25,56304,1173,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(26,56304,1173,1,'java/util/concurrent/FutureTask.run')
+f(27,56304,1173,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(28,56304,1173,1,'java/util/concurrent/FutureTask.run')
+f(29,56304,1173,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(30,56304,1173,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(31,56304,1173,1,'java/lang/Thread.run')
+
+search();
+</script></body></html>
