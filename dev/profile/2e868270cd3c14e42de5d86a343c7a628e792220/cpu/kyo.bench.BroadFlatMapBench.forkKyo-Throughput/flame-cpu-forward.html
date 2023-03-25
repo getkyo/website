@@ -1,0 +1,1169 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 704px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>CPU profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(44);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,264,3,'all')
+f(1,0,1,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(2,0,1,3,'thread_native_entry(Thread*)')
+f(3,0,1,4,'Thread::call_run()')
+f(4,0,1,4,'JavaThread::thread_main_inner()')
+f(5,0,1,4,'CompileBroker::compiler_thread_loop()')
+f(6,0,1,4,'CompileBroker::invoke_compiler_on_method(CompileTask*)')
+f(7,0,1,4,'Compiler::compile_method(ciEnv*, ciMethod*, int, bool, DirectiveSet*)')
+f(8,0,1,4,'Compilation::Compilation(AbstractCompiler*, ciEnv*, ciMethod*, int, BufferBlob*, bool, DirectiveSet*)')
+f(9,0,1,4,'Compilation::compile_method()')
+f(10,0,1,4,'Compilation::compile_java_method()')
+f(11,0,1,4,'Compilation::emit_lir()')
+f(12,0,1,4,'LinearScan::do_linear_scan()')
+f(13,0,1,4,'LinearScan::build_intervals()')
+f(14,0,1,4,'LinearScan::add_use(LIR_OprDesc*, int, int, IntervalUseKind)')
+f(15,0,1,4,'LinearScan::create_interval(int)')
+f(16,0,1,5,'asm_exc_page_fault')
+f(17,0,1,5,'exc_page_fault')
+f(18,0,1,5,'do_user_addr_fault')
+f(19,0,1,5,'handle_mm_fault')
+f(20,0,1,5,'__handle_mm_fault')
+f(21,0,1,5,'handle_pte_fault')
+f(22,0,1,5,'do_anonymous_page')
+f(23,0,1,5,'__mem_cgroup_charge')
+f(24,0,1,5,'rcu_read_unlock_strict')
+f(1,1,263,1,'java/lang/Thread.run')
+f(2,1,263,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(3,1,263,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(4,1,85,1,'java/util/concurrent/FutureTask.run')
+f(5,1,85,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(6,1,85,1,'java/util/concurrent/FutureTask.run')
+f(7,1,85,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(8,1,85,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(9,1,85,1,'java/lang/reflect/Method.invoke')
+f(10,1,85,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(11,1,85,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(12,1,85,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(13,1,85,1,'kyo/bench/jmh_generated/BroadFlatMapBench_forkKyo_jmhTest.forkKyo_Throughput')
+f(14,1,85,1,'kyo/bench/jmh_generated/BroadFlatMapBench_forkKyo_jmhTest.forkKyo_thrpt_jmhStub')
+f(15,2,84,1,'kyo/bench/Bench.forkKyo')
+f(16,2,84,1,'kyo/bench/Bench.runLoop$2')
+f(17,2,36,1,'kyo/bench/Bench$$anon$4.apply')
+f(18,2,36,1,'kyo/bench/Bench$$anon$2.apply')
+f(19,2,36,1,'kyo/bench/Bench.kyo$bench$Bench$$_$_$_$transformLoop$1')
+f(20,2,36,1,'kyo/bench/Bench$$Lambda$40.0x0000000800cd73f8.apply')
+f(21,2,36,1,'kyo/bench/Bench.transformLoop$1$$anonfun$1')
+f(22,2,36,1,'kyo/concurrent/scheduler/Scheduler$.schedule')
+f(23,2,36,1,'kyo/concurrent/scheduler/Scheduler$.submit')
+f(24,2,36,1,'kyo/concurrent/scheduler/Worker.enqueue',3,0,0)
+f(25,4,33,1,'java/util/concurrent/locks/LockSupport.unpark')
+f(26,4,33,1,'jdk/internal/misc/Unsafe.unpark')
+f(27,4,1,3,'Unsafe_Unpark')
+f(28,4,1,4,'Parker::unpark()')
+f(27,5,32,3,'pthread_cond_signal')
+f(28,13,24,5,'entry_SYSCALL_64_after_hwframe')
+f(29,13,24,5,'do_syscall_64')
+f(30,13,24,5,'__x64_sys_futex')
+f(31,13,24,5,'do_futex')
+f(32,13,1,5,'_raw_spin_lock')
+f(32,14,23,5,'futex_wake')
+f(33,16,3,5,'mark_wake_futex')
+f(34,17,2,5,'__unqueue_futex')
+f(33,19,1,5,'wake_q_add_safe')
+f(33,20,17,5,'wake_up_q')
+f(34,20,17,5,'_raw_spin_unlock_irqrestore')
+f(25,37,1,2,'kyo/concurrent/scheduler/Queue.offer',1,0,0)
+f(17,38,48,1,'kyo/concurrent/fibers$$anon$8.apply',3,0,0)
+f(18,38,48,1,'kyo/concurrent/fibers$$anon$8.apply',3,0,0)
+f(19,38,48,1,'kyo/concurrent/scheduler/IOPromise.block',3,0,0)
+f(20,38,48,1,'kyo/concurrent/scheduler/IOPromise.loop$4',3,0,0)
+f(21,38,45,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireSharedInterruptibly')
+f(22,38,45,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(23,39,44,1,'java/util/concurrent/locks/LockSupport.park')
+f(24,39,44,1,'jdk/internal/misc/Unsafe.park')
+f(25,40,1,4,'AccessInternal::PostRuntimeDispatch<G1BarrierSet::AccessBarrier<548964ul, G1BarrierSet>, (AccessInternal::BarrierType)2, 548964ul>::oop_access_barrier(void*)')
+f(25,41,8,3,'Unsafe_Park')
+f(26,43,6,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(27,44,5,5,'entry_SYSCALL_64_after_hwframe')
+f(28,44,2,5,'__x64_sys_futex')
+f(28,46,3,5,'do_syscall_64')
+f(29,46,2,5,'__x64_sys_futex')
+f(30,47,1,5,'do_futex')
+f(31,47,1,5,'futex_wake')
+f(29,48,1,5,'syscall_enter_from_user_mode')
+f(25,49,34,3,'[unknown]')
+f(26,49,33,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(27,53,29,5,'entry_SYSCALL_64_after_hwframe')
+f(28,53,29,5,'do_syscall_64')
+f(29,53,25,5,'__x64_sys_futex')
+f(30,53,24,5,'do_futex')
+f(31,53,24,5,'futex_wait')
+f(32,53,22,5,'futex_wait_queue_me')
+f(33,54,21,5,'schedule')
+f(34,54,21,5,'__schedule')
+f(35,54,21,5,'finish_task_switch.isra.0')
+f(32,75,2,5,'futex_wait_setup')
+f(30,77,1,5,'futex_wait')
+f(29,78,2,5,'syscall_enter_from_user_mode')
+f(29,80,2,5,'syscall_exit_to_user_mode')
+f(30,80,2,5,'exit_to_user_mode_prepare')
+f(31,80,2,5,'exit_to_user_mode_loop')
+f(32,80,2,5,'__rseq_handle_notify_resume')
+f(33,80,2,5,'rseq_ip_fixup')
+f(34,81,1,5,'__get_user_8')
+f(26,82,1,3,'pthread_cond_wait')
+f(21,83,3,2,'kyo/concurrent/scheduler/IOPromise.loop$5',3,0,0)
+f(4,86,4,1,'kyo/concurrent/scheduler/Coordinator$$$Lambda$51.0x0000000800cf3cd8.run')
+f(5,86,4,1,'kyo/concurrent/scheduler/Coordinator$.$init$$$anonfun$1')
+f(6,86,4,1,'kyo/concurrent/scheduler/Coordinator$.update')
+f(7,86,3,1,'java/lang/Thread.sleep')
+f(8,86,1,3,'JVM_Sleep')
+f(9,86,1,4,'HandleMark::pop_and_restore()')
+f(8,87,2,3,'[unknown]')
+f(9,87,2,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(10,88,1,5,'entry_SYSCALL_64_after_hwframe')
+f(11,88,1,5,'do_syscall_64')
+f(12,88,1,5,'__x64_sys_futex')
+f(13,88,1,5,'do_futex')
+f(14,88,1,5,'futex_wait')
+f(7,89,1,1,'java/util/concurrent/ThreadPoolExecutor.execute')
+f(8,89,1,1,'java/util/concurrent/SynchronousQueue.offer')
+f(9,89,1,1,'java/util/concurrent/SynchronousQueue$TransferStack.transfer')
+f(10,89,1,1,'java/util/concurrent/SynchronousQueue$TransferStack$SNode.tryMatch')
+f(11,89,1,1,'java/util/concurrent/locks/LockSupport.unpark')
+f(12,89,1,1,'jdk/internal/misc/Unsafe.unpark')
+f(13,89,1,3,'pthread_cond_signal')
+f(14,89,1,5,'entry_SYSCALL_64_after_hwframe')
+f(15,89,1,5,'do_syscall_64')
+f(16,89,1,5,'__x64_sys_futex')
+f(17,89,1,5,'do_futex')
+f(18,89,1,5,'futex_wake')
+f(19,89,1,5,'wake_up_q')
+f(20,89,1,5,'_raw_spin_unlock_irqrestore')
+f(4,90,174,1,'kyo/concurrent/scheduler/Scheduler$$$Lambda$54.0x0000000800cfacc8.run')
+f(5,90,174,1,'kyo/concurrent/scheduler/Scheduler$.startWorkers$$anonfun$1')
+f(6,90,174,1,'kyo/concurrent/scheduler/Worker.runWorker')
+f(7,90,125,1,'kyo/concurrent/scheduler/IOTask.run',3,0,0)
+f(8,90,125,1,'kyo/concurrent/scheduler/IOTask.eval',3,0,0)
+f(9,90,90,1,'kyo/bench/Bench$$anon$3.apply')
+f(10,90,90,1,'kyo/bench/Bench$$anon$3.apply')
+f(11,90,90,1,'kyo/bench/Bench.kyo$bench$Bench$$_$_$_$v$proxy2$1')
+f(12,90,90,1,'kyo/bench/Bench.kyoBenchFiber')
+f(13,90,90,1,'kyo/bench/BroadFlatMapBench.kyoBench')
+f(14,90,90,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(15,90,44,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(16,90,44,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(17,90,44,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(18,90,44,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(19,90,12,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(20,90,12,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(21,90,12,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(22,90,12,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(23,90,5,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(24,90,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(25,90,5,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(26,90,5,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,90,4,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(28,90,4,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(29,90,4,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(30,90,4,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,90,4,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,90,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(33,90,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(34,90,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(35,90,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,90,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(37,90,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(38,90,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(39,90,1,2,'java/lang/invoke/LambdaForm$DMH.0x0000000800d08800.newInvokeSpecial',1,0,0)
+f(32,91,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,91,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,91,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,91,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,92,2,2,'scala/math/BigInt$.apply',2,0,0)
+f(33,92,2,2,'scala/math/BigInt$.getCached',2,0,0)
+f(27,94,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,94,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(29,94,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(30,94,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(31,94,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,94,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,94,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(34,94,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(23,95,7,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(24,95,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(25,95,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(26,95,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(27,95,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,95,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,95,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,95,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(31,95,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(32,95,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(33,95,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,95,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,95,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,95,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(37,95,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(38,95,1,2,'java/lang/invoke/LambdaForm$DMH.0x0000000800d08800.newInvokeSpecial',1,0,0)
+f(39,95,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(30,96,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,96,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(32,96,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(33,96,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(34,96,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,96,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,96,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(37,96,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(31,97,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,97,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(33,97,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(24,98,4,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,98,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(26,98,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(27,98,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(28,98,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,98,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,98,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,98,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(32,98,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(33,98,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(34,98,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,98,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,99,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,99,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,99,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(28,99,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(29,99,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(30,99,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,99,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,100,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,100,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(34,100,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(27,101,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,101,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,101,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(30,101,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(19,102,32,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(20,102,12,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(21,102,12,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(22,102,12,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(23,102,12,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(24,102,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(25,102,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(26,102,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(27,102,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,102,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(29,102,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(30,102,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(31,102,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,102,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,102,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,103,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(35,103,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(24,104,10,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,104,5,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(26,104,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(27,104,5,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(28,104,5,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,104,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(30,104,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(31,104,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(32,104,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,104,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,105,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(35,105,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(36,105,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(37,105,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(38,105,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(39,105,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(29,106,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,106,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,106,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(32,106,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(33,106,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(34,106,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,106,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(36,106,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(31,107,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,107,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,108,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(25,109,5,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,109,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(27,109,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(28,109,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(29,109,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,109,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(31,109,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(32,109,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(33,109,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,109,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,109,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,110,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,110,2,2,'scala/math/BigInt$.apply',2,0,0)
+f(32,110,2,2,'scala/math/BigInt$.getCached',2,0,0)
+f(26,112,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,112,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(28,112,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(29,112,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(30,112,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,112,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(32,112,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(33,112,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(34,112,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,112,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,112,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(37,112,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(38,112,1,2,'scala/math/BigInt.<init>',1,0,0)
+f(39,112,1,2,'scala/math/ScalaNumber.<init>',1,0,0)
+f(40,112,1,2,'java/lang/Number.<init>',1,0,0)
+f(41,112,1,2,'java/lang/Object.<init>',1,0,0)
+f(31,113,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,113,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(33,113,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(20,114,20,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(21,114,7,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(22,114,7,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(23,114,7,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(24,114,7,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,114,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(26,114,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(27,114,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(28,114,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,114,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(30,114,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(31,114,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(32,114,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,114,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,114,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(35,114,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(36,114,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(37,114,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,115,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,115,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,115,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(37,115,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(38,115,1,2,'scala/math/BigInt.<init>',1,0,0)
+f(39,115,1,2,'scala/math/ScalaNumber.<init>',1,0,0)
+f(40,115,1,2,'java/lang/Number.<init>',1,0,0)
+f(41,115,1,2,'java/lang/Object.<init>',1,0,0)
+f(34,116,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(25,117,4,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,117,3,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(27,117,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(28,117,1,2,'java/lang/invoke/LambdaForm$DMH.0x0000000800d08800.newInvokeSpecial',1,0,0)
+f(29,117,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(27,118,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(28,118,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(29,118,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,118,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,118,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,118,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,119,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(34,119,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(26,120,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,120,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,120,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,120,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,120,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(31,120,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(21,121,12,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(22,121,7,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(23,121,7,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(24,121,7,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(25,121,7,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,121,4,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(27,121,4,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(28,121,4,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(29,121,4,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,121,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(31,121,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(32,121,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(33,121,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,121,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(35,121,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(36,121,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(37,121,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(38,121,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(39,121,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(40,121,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(34,122,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,122,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,123,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(37,123,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(38,123,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(39,123,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,124,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,124,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(32,124,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(33,124,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(34,124,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,124,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,124,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(37,124,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(38,124,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(26,125,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,125,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,125,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(29,125,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(30,125,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(31,125,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,125,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,125,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(34,125,1,2,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply',1,0,0)
+f(35,125,1,2,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1',1,0,0)
+f(33,126,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,127,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(29,127,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(22,128,5,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(23,128,5,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(24,128,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(25,128,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(26,128,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(27,128,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,128,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(29,128,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(30,128,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(31,128,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,128,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(33,128,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(28,129,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,129,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,129,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(31,129,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(32,129,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(33,129,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,129,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,129,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(36,129,1,2,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply',1,0,0)
+f(37,129,1,2,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1',1,0,0)
+f(24,130,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,130,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(26,130,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(27,130,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(28,130,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,130,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,130,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,130,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,130,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(33,130,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(34,130,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(35,130,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,130,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(25,131,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,131,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,132,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(21,133,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(22,133,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(23,133,1,2,'scala/math/BigInt.<init>',1,0,0)
+f(15,134,46,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(16,134,17,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(17,134,17,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(18,134,17,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(19,134,17,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(20,134,5,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(21,134,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(22,134,5,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(23,134,5,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(24,134,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(25,134,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(26,134,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(27,134,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,134,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,134,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(30,134,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(31,134,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(32,134,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,134,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,134,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(29,135,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,135,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(31,135,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(32,135,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(33,135,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,135,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,135,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,135,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(37,135,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(38,135,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(39,135,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(40,135,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(41,135,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(30,136,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,136,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(32,136,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(24,137,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,137,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,138,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,138,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(28,138,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(29,138,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(30,138,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,138,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,138,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,138,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(20,139,12,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(21,139,5,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(22,139,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(23,139,5,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(24,139,5,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,139,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(26,139,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(27,139,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(28,139,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,139,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,139,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,139,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,139,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,139,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(34,139,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(31,140,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(32,140,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(33,140,1,2,'scala/math/BigInt.<init>',1,0,0)
+f(34,140,1,2,'scala/math/ScalaNumber.<init>',1,0,0)
+f(35,140,1,2,'java/lang/Number.<init>',1,0,0)
+f(36,140,1,2,'java/lang/Object.<init>',1,0,0)
+f(25,141,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,141,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,141,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(28,141,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(29,141,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(30,141,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,141,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(32,141,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(33,141,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(34,141,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,141,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(36,141,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(27,142,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,142,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(29,142,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(30,142,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(31,142,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,142,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,142,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,143,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,143,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,143,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,143,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,143,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(33,143,1,2,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply',1,0,0)
+f(34,143,1,2,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1',1,0,0)
+f(21,144,7,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(22,144,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(23,144,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(24,144,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(25,144,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,144,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(27,144,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(28,144,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(29,144,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,145,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,145,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,145,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(33,145,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(34,145,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(35,145,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,145,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(37,145,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(38,145,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(39,145,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(40,145,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(41,145,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(42,145,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(30,146,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(31,146,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(22,147,4,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(23,147,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(24,147,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(25,147,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(26,147,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,147,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(28,147,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(29,147,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(30,147,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,147,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(32,147,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(33,147,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(34,147,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,147,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(36,147,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(37,147,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(38,147,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(39,147,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(40,147,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(41,147,1,2,'scala/math/BigInt.<init>',1,0,0)
+f(42,147,1,2,'scala/math/ScalaNumber.<init>',1,0,0)
+f(43,147,1,2,'java/lang/Number.<init>',1,0,0)
+f(27,148,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,148,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(29,148,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(30,148,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(31,148,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,148,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,148,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,148,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(35,148,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(23,149,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(24,149,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,150,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(16,151,29,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(17,151,12,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(18,151,12,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(19,151,12,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(20,151,12,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(21,151,4,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(22,151,4,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(23,151,4,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(24,151,4,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,151,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(26,151,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(27,151,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(28,151,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,151,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(30,151,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(31,151,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(32,151,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,151,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,151,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,151,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,151,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(37,151,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(38,151,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(39,151,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,152,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,152,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(27,152,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(28,152,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(29,152,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,152,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(31,152,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(32,152,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(33,152,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,153,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,153,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,153,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,153,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(33,154,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,154,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,154,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(36,154,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(21,155,8,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(22,155,5,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(23,155,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(24,155,5,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(25,155,5,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,155,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(27,155,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(28,155,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(29,155,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,155,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,155,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,155,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(33,155,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(34,155,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(35,155,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(36,155,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(37,155,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(38,155,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(39,155,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,156,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,156,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,156,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(35,156,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(36,156,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(37,156,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(38,156,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(39,156,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(40,156,1,2,'scala/math/BigInt.<init>',1,0,0)
+f(41,156,1,2,'scala/math/ScalaNumber.<init>',1,0,0)
+f(33,157,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(34,157,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(26,158,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,158,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(28,158,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(29,158,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(30,158,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,159,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,159,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,159,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(34,159,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(35,159,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(36,159,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(22,160,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(23,160,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(24,160,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(25,160,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(26,160,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,160,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(28,160,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(29,160,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(30,160,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,160,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,160,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,160,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,160,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,160,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(36,160,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(37,160,1,2,'scala/math/BigInt.<init>',1,0,0)
+f(23,161,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(24,161,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,161,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(26,161,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(27,161,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(28,161,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,161,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(30,161,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(31,161,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(32,161,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,161,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,161,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,161,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(36,161,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(25,162,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,162,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,162,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(28,162,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(29,162,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(30,162,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,162,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,162,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(17,163,17,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(18,163,5,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(19,163,5,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(20,163,5,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(21,163,5,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(22,163,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(23,163,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(24,163,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(25,163,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,163,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,163,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(28,163,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(29,163,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(30,163,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,163,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(32,163,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(33,163,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(34,163,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,163,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,164,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,164,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,164,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,164,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(31,164,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(22,165,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(23,165,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(24,165,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(25,165,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(26,165,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,165,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,165,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,165,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,165,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(31,165,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(23,166,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(24,166,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(25,166,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(26,166,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(27,166,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,166,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,166,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(30,166,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(24,167,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,167,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,167,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,167,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,167,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(18,168,12,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(19,168,3,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(20,168,3,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(21,168,3,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(22,168,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(23,168,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(24,168,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(25,168,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(26,168,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,168,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,168,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(29,168,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(30,168,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(31,168,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,168,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(33,168,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(23,169,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(24,169,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(25,169,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(26,169,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(27,169,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,169,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,169,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,169,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(31,169,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(24,170,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,170,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(26,170,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(19,171,9,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(20,171,4,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(21,171,4,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(22,171,4,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(23,171,4,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(24,171,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(25,171,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(26,171,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(27,171,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,171,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(29,171,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(30,171,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(31,171,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(32,171,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(33,171,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(28,172,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(24,173,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,173,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(26,173,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(27,173,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(28,173,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,173,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(30,173,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(31,173,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(32,173,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(33,173,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,173,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,173,1,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(36,173,1,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',1,0,0)
+f(37,173,1,2,'java/lang/invoke/LambdaForm$DMH.0x0000000800d08800.newInvokeSpecial',1,0,0)
+f(25,174,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(26,174,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(27,174,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(28,174,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,174,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(30,174,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(20,175,5,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(21,175,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(22,175,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(23,175,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(24,175,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(25,175,2,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(26,175,2,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(27,175,2,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(28,175,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(29,175,2,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(30,175,1,1,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1')
+f(31,175,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(32,175,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(33,175,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(34,175,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(35,175,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(30,176,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(31,176,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(32,176,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(21,177,3,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(22,177,2,2,'kyo/bench/BroadFlatMapBench.kyo$bench$BroadFlatMapBench$$_$transformLoop$1',1,0,0)
+f(23,178,1,1,'kyo/bench/BroadFlatMapBench$$Lambda$57.0x0000000800d0dac0.apply')
+f(24,178,1,1,'kyo/bench/BroadFlatMapBench.transformLoop$1$$anonfun$1')
+f(25,178,1,1,'kyo/bench/BroadFlatMapBench.kyoFib$1')
+f(22,179,1,2,'scala/math/BigInt$.apply',1,0,0)
+f(23,179,1,2,'scala/math/BigInt$.getCached',1,0,0)
+f(9,180,35,1,'kyo/concurrent/scheduler/IOTask.loop$6',3,0,0)
+f(10,180,2,2,'java/util/concurrent/atomic/AtomicReference.compareAndSet',2,0,0)
+f(11,180,2,2,'java/lang/invoke/VarHandleGuards.guard_LLL_Z',2,0,0)
+f(12,180,2,2,'java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.compareAndSet',2,0,0)
+f(10,182,33,1,'kyo/concurrent/scheduler/IOPromise$Pending.flush',1,0,0)
+f(11,182,33,1,'kyo/concurrent/scheduler/IOPromise$Pending.loop$7',1,0,0)
+f(12,182,33,1,'kyo/concurrent/scheduler/IOPromise$$anon$2.run',1,0,0)
+f(13,182,33,1,'kyo/concurrent/scheduler/IOPromise$$anon$1.apply',1,0,0)
+f(14,182,33,1,'kyo/concurrent/scheduler/IOPromise$$anon$1.apply',1,0,0)
+f(15,182,33,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.releaseShared',1,0,0)
+f(16,182,33,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.signalNext',1,0,0)
+f(17,183,32,1,'java/util/concurrent/locks/LockSupport.unpark')
+f(18,183,32,1,'jdk/internal/misc/Unsafe.unpark')
+f(19,183,1,3,'Unsafe_Unpark')
+f(20,183,1,4,'ThreadsListHandle::ThreadsListHandle(Thread*)')
+f(19,184,31,3,'pthread_cond_signal')
+f(20,190,25,5,'entry_SYSCALL_64_after_hwframe')
+f(21,190,25,5,'do_syscall_64')
+f(22,190,25,5,'__x64_sys_futex')
+f(23,190,25,5,'do_futex')
+f(24,190,25,5,'futex_wake')
+f(25,191,24,5,'wake_up_q')
+f(26,191,24,5,'_raw_spin_unlock_irqrestore')
+f(7,215,3,2,'kyo/concurrent/scheduler/Queue.poll',3,0,0)
+f(8,215,1,2,'java/util/concurrent/atomic/AtomicBoolean.compareAndSet',1,0,0)
+f(8,216,2,2,'scala/collection/mutable/PriorityQueue.dequeue',2,0,0)
+f(9,217,1,2,'scala/collection/mutable/PriorityQueue.fixDown',1,0,0)
+f(7,218,46,1,'kyo/concurrent/scheduler/Scheduler$.idle')
+f(8,218,2,2,'java/util/AbstractQueue.add',2,0,0)
+f(9,218,2,2,'org/jctools/queues/MpmcUnboundedXaddArrayQueue.offer',2,0,0)
+f(10,218,2,2,'org/jctools/queues/MpUnboundedXaddArrayQueue.producerChunkForIndex',2,0,0)
+f(11,219,1,2,'org/jctools/queues/MpUnboundedXaddArrayQueue.appendNextChunks',1,0,0)
+f(12,219,1,2,'org/jctools/queues/MpUnboundedXaddArrayQueueProducerChunk.soProducerChunk',1,0,0)
+f(13,219,1,2,'sun/misc/Unsafe.putOrderedObject',1,0,0)
+f(8,220,44,1,'kyo/concurrent/scheduler/Worker.park')
+f(9,220,44,1,'java/util/concurrent/locks/LockSupport.parkNanos')
+f(10,220,44,1,'jdk/internal/misc/Unsafe.park')
+f(11,220,1,4,'AccessInternal::PostRuntimeDispatch<G1BarrierSet::AccessBarrier<548964ul, G1BarrierSet>, (AccessInternal::BarrierType)2, 548964ul>::oop_access_barrier(void*)')
+f(11,221,11,3,'Unsafe_Park')
+f(12,223,5,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(13,226,2,5,'entry_SYSCALL_64_after_hwframe')
+f(14,226,2,5,'do_syscall_64')
+f(15,226,1,5,'__x64_sys_futex')
+f(16,226,1,5,'do_futex')
+f(17,226,1,5,'futex_wake')
+f(15,227,1,5,'do_futex')
+f(12,228,1,4,'Parker::park(bool, long)')
+f(12,229,3,3,'clock_gettime')
+f(13,230,2,3,'[vdso]')
+f(11,232,32,3,'[unknown]')
+f(12,232,29,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(13,241,20,5,'entry_SYSCALL_64_after_hwframe')
+f(14,241,20,5,'do_syscall_64')
+f(15,241,16,5,'__x64_sys_futex')
+f(16,242,15,5,'do_futex')
+f(17,242,14,5,'futex_wait')
+f(18,244,9,5,'futex_wait_queue_me')
+f(19,245,1,5,'hrtimer_sleeper_start_expires')
+f(20,245,1,5,'_raw_spin_unlock_irqrestore')
+f(19,246,7,5,'schedule')
+f(20,246,7,5,'__schedule')
+f(21,246,7,5,'finish_task_switch.isra.0')
+f(18,253,2,5,'futex_wait_setup')
+f(18,255,1,5,'hrtimer_cancel')
+f(19,255,1,5,'_raw_spin_unlock_irqrestore')
+f(17,256,1,5,'ktime_add_safe')
+f(15,257,1,5,'syscall_enter_from_user_mode')
+f(15,258,3,5,'syscall_exit_to_user_mode')
+f(16,258,3,5,'exit_to_user_mode_prepare')
+f(17,258,3,5,'exit_to_user_mode_loop')
+f(18,258,3,5,'__rseq_handle_notify_resume')
+f(19,258,3,5,'rseq_ip_fixup')
+f(20,260,1,5,'__get_user_8')
+f(12,261,3,3,'pthread_cond_timedwait')
+
+search();
+</script></body></html>
