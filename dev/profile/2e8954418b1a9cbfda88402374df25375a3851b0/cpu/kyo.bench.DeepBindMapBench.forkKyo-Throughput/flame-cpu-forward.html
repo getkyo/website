@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 1056px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>CPU profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(66);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,491,3,'all')
+f(1,0,22,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(2,0,1,5,'entry_SYSCALL_64_after_hwframe')
+f(3,0,1,5,'do_syscall_64')
+f(4,0,1,5,'__x64_sys_futex')
+f(5,0,1,5,'do_futex')
+f(6,0,1,5,'futex_wait')
+f(7,0,1,5,'futex_wait_queue_me')
+f(8,0,1,5,'schedule')
+f(9,0,1,5,'__schedule')
+f(10,0,1,5,'finish_task_switch.isra.0')
+f(2,1,21,3,'thread_native_entry(Thread*)')
+f(3,1,21,4,'Thread::call_run()')
+f(4,1,3,4,'GangWorker::run()')
+f(5,1,3,4,'GangWorker::loop()')
+f(6,1,1,4,'G1BatchedGangTask::work(unsigned int)')
+f(7,1,1,4,'G1PostEvacuateCollectionSetCleanupTask2::FreeCollectionSetTask::do_work(unsigned int)')
+f(8,1,1,4,'G1CollectionSet::par_iterate(HeapRegionClosure*, HeapRegionClaimer*, unsigned int, unsigned int) const')
+f(9,1,1,4,'G1CollectionSet::iterate_part_from(HeapRegionClosure*, HeapRegionClaimer*, unsigned long, unsigned long, unsigned int, unsigned int) const [clone .part.0]')
+f(10,1,1,4,'FreeCSetClosure::do_heap_region(HeapRegion*)')
+f(11,1,1,4,'G1CollectedHeap::free_region(HeapRegion*, FreeRegionList*)')
+f(12,1,1,4,'HeapRegion::hr_clear(bool)')
+f(13,1,1,4,'HeapRegionRemSet::clear_locked(bool)')
+f(6,2,2,4,'G1EvacuateRegionsBaseTask::work(unsigned int)')
+f(7,2,1,4,'G1EvacuateRegionsTask::evacuate_live_objects(G1ParScanThreadState*, unsigned int)')
+f(8,2,1,4,'G1ParEvacuateFollowersClosure::do_void()')
+f(9,2,1,4,'TaskTerminator::offer_termination(TerminatorTerminator*)')
+f(7,3,1,4,'G1EvacuateRegionsTask::scan_roots(G1ParScanThreadState*, unsigned int)')
+f(8,3,1,4,'G1RootProcessor::evacuate_roots(G1ParScanThreadState*, unsigned int)')
+f(9,3,1,4,'G1RootProcessor::process_java_roots(G1RootClosures*, G1GCPhaseTimes*, unsigned int)')
+f(10,3,1,4,'CodeCacheSweeperThread::oops_do_no_frames(OopClosure*, CodeBlobClosure*)')
+f(4,4,17,4,'JavaThread::thread_main_inner()')
+f(5,4,17,4,'CompileBroker::compiler_thread_loop()')
+f(6,4,17,4,'CompileBroker::invoke_compiler_on_method(CompileTask*)')
+f(7,4,16,4,'C2Compiler::compile_method(ciEnv*, ciMethod*, int, bool, DirectiveSet*)')
+f(8,4,16,4,'Compile::Compile(ciEnv*, ciMethod*, int, bool, bool, bool, bool, bool, DirectiveSet*)')
+f(9,4,11,4,'Compile::Code_Gen()')
+f(10,4,1,4,'Matcher::match()')
+f(11,4,1,4,'Matcher::xform(Node*, int)')
+f(12,4,1,4,'Matcher::match_tree(Node const*)')
+f(13,4,1,4,'Matcher::Label_Root(Node const*, State*, Node*, Node*&)')
+f(14,4,1,4,'Matcher::Label_Root(Node const*, State*, Node*, Node*&)')
+f(15,4,1,4,'Matcher::Label_Root(Node const*, State*, Node*, Node*&)')
+f(16,4,1,4,'Matcher::Label_Root(Node const*, State*, Node*, Node*&)')
+f(10,5,10,4,'PhaseChaitin::Register_Allocate()')
+f(11,5,2,4,'PhaseChaitin::Split(unsigned int, ResourceArea*)')
+f(11,7,1,4,'PhaseChaitin::build_ifg_physical(ResourceArea*)')
+f(12,7,1,4,'MachNode::rematerialize() const')
+f(11,8,3,4,'PhaseChaitin::gather_lrg_masks(bool)')
+f(12,9,1,4,'MachNode::in_RegMask(unsigned int) const')
+f(12,10,1,4,'RegMask::is_misaligned_pair() const')
+f(11,11,3,4,'PhaseChaitin::post_allocate_copy_removal()')
+f(12,11,1,4,'Arena::grow(unsigned long, AllocFailStrategy::AllocFailEnum)')
+f(13,11,1,4,'ChunkPool::allocate(unsigned long, AllocFailStrategy::AllocFailEnum)')
+f(12,12,2,4,'PhaseChaitin::elide_copy(Node*, int, Block*, Node_List&, Node_List&, bool)')
+f(11,14,1,4,'PhaseLive::compute(unsigned int)')
+f(12,14,1,4,'PhaseLive::add_liveout(Block*, IndexSet*, VectorSet&)')
+f(9,15,3,4,'Compile::Optimize()')
+f(10,15,1,4,'PhaseIdealLoop::optimize(PhaseIterGVN&, LoopOptsMode)')
+f(11,15,1,4,'PhaseIdealLoop::build_and_optimize(LoopOptsMode)')
+f(12,15,1,4,'PhaseIdealLoop::build_loop_tree()')
+f(10,16,1,4,'PhaseIterGVN::optimize()')
+f(11,16,1,4,'PhaseIterGVN::transform_old(Node*)')
+f(12,16,1,4,'PhiNode::Value(PhaseGVN*) const')
+f(13,16,1,4,'Type::meet_helper(Type const*, bool) const')
+f(10,17,1,4,'PhaseRenumberLive::PhaseRenumberLive(PhaseGVN*, Unique_Node_List*, Unique_Node_List*, Phase::PhaseNumber)')
+f(11,17,1,4,'PhaseRemoveUseless::PhaseRemoveUseless(PhaseGVN*, Unique_Node_List*, Phase::PhaseNumber)')
+f(9,18,2,4,'ParseGenerator::generate(JVMState*)')
+f(10,18,2,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(11,18,2,4,'Parse::do_all_blocks()')
+f(12,18,2,4,'Parse::do_one_block()')
+f(13,18,2,4,'Parse::do_call()')
+f(14,18,2,4,'PredictedCallGenerator::generate(JVMState*)')
+f(15,18,2,4,'ParseGenerator::generate(JVMState*)')
+f(16,18,2,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(17,18,2,4,'Parse::do_all_blocks()')
+f(18,18,2,4,'Parse::do_one_block()')
+f(19,18,2,4,'Parse::do_call()')
+f(20,18,2,4,'PredictedCallGenerator::generate(JVMState*)')
+f(21,18,2,4,'ParseGenerator::generate(JVMState*)')
+f(22,18,2,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(23,18,2,4,'Parse::do_all_blocks()')
+f(24,18,2,4,'Parse::do_one_block()')
+f(25,18,2,4,'Parse::do_call()')
+f(26,18,2,4,'PredictedCallGenerator::generate(JVMState*)')
+f(27,18,2,4,'ParseGenerator::generate(JVMState*)')
+f(28,18,2,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(29,18,2,4,'Parse::do_all_blocks()')
+f(30,18,2,4,'Parse::do_one_block()')
+f(31,18,2,4,'Parse::do_call()')
+f(32,18,1,4,'Compile::call_generator(ciMethod*, int, bool, JVMState*, bool, float, ciKlass*, bool)')
+f(33,18,1,4,'InlineTree::ok_to_inline(ciMethod*, JVMState*, ciCallProfile&, bool&)')
+f(34,18,1,4,'ciMethod::get_flow_analysis()')
+f(35,18,1,4,'ciTypeFlow::do_flow()')
+f(36,18,1,4,'ciTypeFlow::flow_types()')
+f(37,18,1,4,'ciTypeFlow::df_flow_types(ciTypeFlow::Block*, bool, ciTypeFlow::StateVector*, ciTypeFlow::JsrSet*)')
+f(38,18,1,4,'ciTypeFlow::flow_block(ciTypeFlow::Block*, ciTypeFlow::StateVector*, ciTypeFlow::JsrSet*)')
+f(39,18,1,4,'ciTypeFlow::StateVector::apply_one_bytecode(ciBytecodeStream*)')
+f(40,18,1,4,'ciTypeFlow::StateVector::do_invoke(ciBytecodeStream*, bool)')
+f(41,18,1,4,'ciBytecodeStream::get_method(bool&, ciSignature**)')
+f(42,18,1,4,'ciEnv::get_method_by_index_impl(constantPoolHandle const&, int, Bytecodes::Code, ciInstanceKlass*)')
+f(43,18,1,4,'MethodHandles::signature_polymorphic_name_id(Klass*, Symbol*)')
+f(44,18,1,4,'MethodHandles::is_method_handle_invoke_name(Klass*, Symbol*)')
+f(45,18,1,4,'InstanceKlass::find_method(Symbol const*, Symbol const*) const')
+f(46,18,1,4,'InstanceKlass::find_method_index(Array<Method*> const*, Symbol const*, Symbol const*, Klass::OverpassLookupMode, Klass::StaticLookupMode, Klass::PrivateLookupMode) [clone .constprop.0]')
+f(32,19,1,4,'PredictedCallGenerator::generate(JVMState*)')
+f(33,19,1,4,'ParseGenerator::generate(JVMState*)')
+f(34,19,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(35,19,1,4,'Parse::do_all_blocks()')
+f(36,19,1,4,'Parse::do_one_block()')
+f(37,19,1,4,'Parse::do_call()')
+f(38,19,1,4,'PredictedCallGenerator::generate(JVMState*)')
+f(39,19,1,4,'ParseGenerator::generate(JVMState*)')
+f(40,19,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(41,19,1,4,'Parse::do_all_blocks()')
+f(42,19,1,4,'Parse::do_one_block()')
+f(43,19,1,4,'Parse::do_call()')
+f(44,19,1,4,'PredictedCallGenerator::generate(JVMState*)')
+f(45,19,1,4,'ParseGenerator::generate(JVMState*)')
+f(46,19,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(47,19,1,4,'Parse::do_all_blocks()')
+f(48,19,1,4,'Parse::do_one_block()')
+f(49,19,1,4,'Parse::do_call()')
+f(50,19,1,4,'PredictedCallGenerator::generate(JVMState*)')
+f(51,19,1,4,'ParseGenerator::generate(JVMState*)')
+f(52,19,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(53,19,1,4,'Parse::do_all_blocks()')
+f(54,19,1,4,'Parse::do_one_block()')
+f(55,19,1,4,'Parse::do_call()')
+f(56,19,1,4,'ParseGenerator::generate(JVMState*)')
+f(57,19,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(58,19,1,4,'Parse::do_all_blocks()')
+f(59,19,1,4,'Parse::do_one_block()')
+f(60,19,1,4,'Parse::do_field_access(bool, bool)')
+f(61,19,1,4,'GraphKit::null_check_common(Node*, BasicType, bool, Node**, bool) [clone .part.0]')
+f(62,19,1,4,'TypePtr::xmeet(Type const*) const')
+f(63,19,1,4,'TypeInstPtr::xmeet_helper(Type const*) const')
+f(64,19,1,4,'Type::hashcons()')
+f(65,19,1,4,'Type::uhash(Type const*)')
+f(7,20,1,4,'Compiler::compile_method(ciEnv*, ciMethod*, int, bool, DirectiveSet*)')
+f(8,20,1,4,'Compilation::Compilation(AbstractCompiler*, ciEnv*, ciMethod*, int, BufferBlob*, bool, DirectiveSet*)')
+f(9,20,1,4,'Compilation::compile_method()')
+f(10,20,1,4,'Compilation::compile_java_method()')
+f(11,20,1,4,'Compilation::emit_lir()')
+f(12,20,1,4,'LinearScan::do_linear_scan()')
+f(13,20,1,4,'LinearScan::assign_reg_num(GrowableArray<LIR_Op*>*, IntervalWalker*)')
+f(4,21,1,4,'VMThread::run()')
+f(5,21,1,4,'VMThread::inner_execute(VM_Operation*)')
+f(6,21,1,4,'VMThread::evaluate_operation(VM_Operation*)')
+f(7,21,1,4,'VM_Operation::evaluate()')
+f(8,21,1,4,'VM_G1CollectForAllocation::doit()')
+f(9,21,1,4,'G1CollectedHeap::do_collection_pause_at_safepoint(double)')
+f(10,21,1,4,'ConcurrentGCThread::should_terminate() const')
+f(1,22,469,1,'java/lang/Thread.run')
+f(2,22,469,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(3,22,469,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(4,22,9,1,'java/util/concurrent/FutureTask.run')
+f(5,22,9,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(6,22,9,1,'java/util/concurrent/FutureTask.run')
+f(7,22,9,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(8,22,9,1,'org/openjdk/jmh/runner/BenchmarkHandler$BenchmarkTask.call')
+f(9,22,9,1,'java/lang/reflect/Method.invoke')
+f(10,22,9,1,'jdk/internal/reflect/DelegatingMethodAccessorImpl.invoke')
+f(11,22,9,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke')
+f(12,22,9,1,'jdk/internal/reflect/NativeMethodAccessorImpl.invoke0')
+f(13,22,9,1,'kyo/bench/jmh_generated/DeepBindMapBench_forkKyo_jmhTest.forkKyo_Throughput')
+f(14,22,9,1,'kyo/bench/jmh_generated/DeepBindMapBench_forkKyo_jmhTest.forkKyo_thrpt_jmhStub')
+f(15,22,9,1,'kyo/bench/Bench.forkKyo')
+f(16,22,9,1,'kyo/ios$IOs.run')
+f(17,22,9,1,'kyo/ios$IOs.runLoop$1')
+f(18,22,7,1,'kyo/core$$anon$5.apply')
+f(19,22,7,1,'kyo/core$$anon$5.apply')
+f(20,22,7,1,'kyo/core$.kyo$core$$$_$transformLoop$1')
+f(21,22,7,1,'kyo/concurrent/fibers$Fibers$$Lambda$46.0x0000000800cedf18.apply')
+f(22,22,7,1,'kyo/concurrent/fibers$Fibers.forkFiber$$anonfun$1',2,0,0)
+f(23,22,7,1,'kyo/concurrent/scheduler/IOTask$.apply',2,0,0)
+f(24,22,7,1,'kyo/concurrent/scheduler/Scheduler$.schedule',2,0,0)
+f(25,22,7,1,'kyo/concurrent/scheduler/Scheduler$.submit',2,1,0)
+f(26,22,3,2,'kyo/concurrent/scheduler/Scheduler$.randomWorker',3,0,0)
+f(27,24,1,2,'java/util/Random.nextInt',1,0,0)
+f(28,24,1,2,'kyo/concurrent/scheduler/XSRandom$.next',1,0,0)
+f(26,25,3,2,'kyo/concurrent/scheduler/Worker.enqueue',3,0,0)
+f(27,25,3,2,'kyo/concurrent/scheduler/Queue.offer',3,0,0)
+f(28,25,2,2,'java/util/concurrent/atomic/AtomicBoolean.compareAndSet',2,0,0)
+f(29,26,1,2,'java/lang/invoke/VarHandleGuards.guard_LII_Z',1,0,0)
+f(30,26,1,2,'java/lang/invoke/VarHandleInts$FieldInstanceReadWrite.compareAndSet',1,0,0)
+f(28,27,1,2,'scala/collection/mutable/PriorityQueue.addOne',1,0,0)
+f(26,28,1,2,'kyo/concurrent/scheduler/Worker.load',1,0,0)
+f(18,29,2,1,'kyo/ios$IOs$$anon$4.apply')
+f(19,29,2,1,'kyo/ios$IOs$$anon$4.apply')
+f(20,29,2,1,'kyo/concurrent/fibers$$$Lambda$58.0x0000000800d0c3d8.apply')
+f(21,29,2,1,'kyo/concurrent/fibers$.block$$anonfun$1')
+f(22,29,2,1,'kyo/concurrent/scheduler/IOPromise.block')
+f(23,29,2,1,'kyo/concurrent/scheduler/IOPromise.loop$8')
+f(24,29,2,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquireSharedInterruptibly')
+f(25,29,2,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(26,29,2,1,'java/util/concurrent/locks/LockSupport.park')
+f(27,29,2,1,'jdk/internal/misc/Unsafe.park')
+f(28,29,2,3,'[unknown]')
+f(29,29,2,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(4,31,2,1,'kyo/concurrent/scheduler/Coordinator$$$Lambda$53.0x0000000800cf63f8.run')
+f(5,31,2,1,'kyo/concurrent/scheduler/Coordinator$.$init$$$anonfun$1')
+f(6,31,2,1,'kyo/concurrent/scheduler/Coordinator$.update')
+f(7,32,1,1,'java/lang/Thread.sleep')
+f(8,32,1,3,'JVM_Sleep')
+f(9,32,1,4,'JavaThread::sleep(long)')
+f(10,32,1,4,'java_lang_Thread::interrupted(oopDesc*)')
+f(4,33,458,1,'kyo/concurrent/scheduler/Scheduler$$$Lambda$56.0x0000000800cfab68.run')
+f(5,33,458,1,'kyo/concurrent/scheduler/Scheduler$.startWorkers$$anonfun$1')
+f(6,33,458,1,'kyo/concurrent/scheduler/Worker.runWorker')
+f(7,33,455,1,'kyo/concurrent/scheduler/IOTask.run')
+f(8,33,455,1,'kyo/concurrent/scheduler/IOTask.eval')
+f(9,44,1,1,'kyo/concurrent/scheduler/IOPromise.complete')
+f(10,44,1,1,'kyo/concurrent/scheduler/IOPromise.loop$7')
+f(11,44,1,1,'kyo/concurrent/scheduler/IOPromise$Pending.flush')
+f(12,44,1,1,'kyo/concurrent/scheduler/IOPromise$Pending.loop$10')
+f(13,44,1,1,'kyo/concurrent/scheduler/IOPromise$$anon$1.run')
+f(14,44,1,1,'kyo/concurrent/scheduler/IOPromise$$anon$2.apply')
+f(15,44,1,1,'kyo/concurrent/scheduler/IOPromise$$anon$2.apply')
+f(16,44,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.releaseShared')
+f(17,44,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.signalNext')
+f(18,44,1,1,'java/util/concurrent/locks/LockSupport.unpark')
+f(19,44,1,1,'jdk/internal/misc/Unsafe.unpark')
+f(20,44,1,3,'pthread_cond_signal')
+f(21,44,1,5,'entry_SYSCALL_64_after_hwframe')
+f(22,44,1,5,'do_syscall_64')
+f(23,44,1,5,'__x64_sys_futex')
+f(24,44,1,5,'do_futex')
+f(25,44,1,5,'futex_wake')
+f(26,44,1,5,'wake_up_q')
+f(27,44,1,5,'_raw_spin_unlock_irqrestore')
+f(9,45,302,1,'kyo/core$$anon$5.apply',11,0,0)
+f(10,47,1,2,'kyo/concurrent/scheduler/IOTask.apply',1,0,0)
+f(10,48,288,1,'kyo/core$$anon$5.apply',8,0,0)
+f(11,53,2,2,'kyo/concurrent/scheduler/IOTask.apply',2,0,0)
+f(11,55,272,1,'kyo/core$$anon$5.apply')
+f(12,59,256,1,'kyo/core$$anon$5.apply')
+f(13,64,224,1,'kyo/core$$anon$5.apply')
+f(14,75,196,1,'kyo/core$$anon$5.apply')
+f(15,88,166,1,'kyo/core$$anon$5.apply')
+f(16,100,138,1,'kyo/core$$anon$5.apply')
+f(17,111,115,1,'kyo/core$$anon$5.apply')
+f(18,122,94,1,'kyo/core$$anon$5.apply')
+f(19,127,64,1,'kyo/core$$anon$5.apply')
+f(20,134,4,1,'kyo/core$$anon$5.apply')
+f(21,136,2,2,'kyo/core$.kyo$core$$$_$transformLoop$1',2,0,0)
+f(22,136,2,2,'kyo/core$$anon$5.<init>',2,0,0)
+f(23,136,2,2,'kyo/core$KyoCont.<init>',2,0,0)
+f(20,138,13,2,'kyo/core$.kyo$core$$$_$transformLoop$1',7,0,0)
+f(21,139,6,3,'itable stub')
+f(21,145,6,1,'kyo/bench/DeepBindMapBench$$Lambda$61.0x0000000800d0ce28.apply')
+f(22,148,3,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$1',3,0,0)
+f(23,148,3,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$2',3,0,0)
+f(24,148,3,2,'scala/runtime/BoxesRunTime.boxToInteger',3,0,0)
+f(25,149,2,2,'java/lang/Integer.valueOf',2,0,0)
+f(20,151,40,1,'kyo/ios$IOs$$anon$4.apply')
+f(21,157,34,2,'kyo/ios$IOs$$anon$4.apply',24,0,0)
+f(22,157,21,3,'itable stub')
+f(22,178,3,2,'kyo/bench/DeepBindMapBench$$Lambda$59.0x0000000800d0c8b0.apply',3,0,0)
+f(23,178,3,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1',3,0,0)
+f(24,178,3,2,'scala/runtime/BoxesRunTime.boxToInteger',3,0,0)
+f(22,181,10,1,'kyo/bench/DeepBindMapBench$$Lambda$60.0x0000000800d0cb70.apply')
+f(23,189,2,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$1',2,0,0)
+f(24,189,2,2,'scala/runtime/BoxesRunTime.boxToInteger',2,0,0)
+f(25,190,1,2,'java/lang/Integer.valueOf',1,0,0)
+f(19,191,25,2,'kyo/core$.kyo$core$$$_$transformLoop$1',17,0,0)
+f(20,192,7,3,'itable stub')
+f(20,199,8,1,'kyo/bench/DeepBindMapBench$$Lambda$62.0x0000000800d0d1f0.apply')
+f(21,200,7,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$2',7,0,0)
+f(22,200,7,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$3',7,0,0)
+f(23,200,7,2,'scala/runtime/BoxesRunTime.boxToInteger',7,0,0)
+f(24,202,5,2,'java/lang/Integer.valueOf',5,0,0)
+f(20,207,9,2,'kyo/core$$anon$5.<init>',9,0,0)
+f(21,207,9,2,'kyo/core$KyoCont.<init>',9,0,0)
+f(18,216,10,2,'kyo/core$.kyo$core$$$_$transformLoop$1',5,0,0)
+f(19,217,4,3,'itable stub')
+f(19,221,5,1,'kyo/bench/DeepBindMapBench$$Lambda$63.0x0000000800d0d5b8.apply')
+f(20,221,5,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$3',3,0,0)
+f(21,221,5,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$4',3,0,0)
+f(22,221,5,2,'scala/runtime/BoxesRunTime.boxToInteger',3,0,0)
+f(23,223,3,2,'java/lang/Integer.valueOf',1,0,0)
+f(24,224,1,4,'ClassLoaderData::holder_phantom() const')
+f(24,225,1,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(25,225,1,4,'InstanceKlass::allocate_instance(JavaThread*)')
+f(26,225,1,4,'MemAllocator::allocate() const')
+f(27,225,1,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(28,225,1,4,'G1CollectedHeap::allocate_new_tlab(unsigned long, unsigned long, unsigned long*)')
+f(29,225,1,4,'G1CollectedHeap::attempt_allocation_slow(unsigned long)')
+f(30,225,1,4,'HSpaceCounters::update_used(unsigned long)')
+f(17,226,12,2,'kyo/core$.kyo$core$$$_$transformLoop$1',6,0,0)
+f(18,226,3,3,'itable stub')
+f(18,229,6,1,'kyo/bench/DeepBindMapBench$$Lambda$64.0x0000000800d0d980.apply')
+f(19,230,5,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$4',5,0,0)
+f(20,230,5,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$5',5,0,0)
+f(21,230,5,2,'scala/runtime/BoxesRunTime.boxToInteger',5,0,0)
+f(22,233,2,2,'java/lang/Integer.valueOf',2,0,0)
+f(18,235,3,2,'kyo/core$$anon$5.<init>',3,0,0)
+f(19,235,3,2,'kyo/core$KyoCont.<init>',3,0,0)
+f(16,238,16,2,'kyo/core$.kyo$core$$$_$transformLoop$1',6,0,0)
+f(17,239,5,3,'itable stub')
+f(17,244,10,1,'kyo/bench/DeepBindMapBench$$Lambda$65.0x0000000800d0dd48.apply')
+f(18,249,5,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$5',4,0,0)
+f(19,249,5,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$6',4,0,0)
+f(20,249,5,2,'scala/runtime/BoxesRunTime.boxToInteger',4,0,0)
+f(21,250,4,2,'java/lang/Integer.valueOf',3,0,0)
+f(22,253,1,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(23,253,1,4,'InstanceKlass::allocate_instance(JavaThread*)')
+f(24,253,1,4,'MemAllocator::allocate() const')
+f(25,253,1,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(26,253,1,4,'G1CollectedHeap::allocate_new_tlab(unsigned long, unsigned long, unsigned long*)')
+f(27,253,1,4,'G1CollectedHeap::attempt_allocation_slow(unsigned long)')
+f(28,253,1,4,'G1AllocRegion::new_alloc_region_and_allocate(unsigned long, bool)')
+f(29,253,1,4,'G1CollectedHeap::new_mutator_alloc_region(unsigned long, bool, unsigned int)')
+f(30,253,1,4,'G1RemSetTrackingPolicy::update_at_allocate(HeapRegion*)')
+f(31,253,1,4,'G1FromCardCache::clear(unsigned int)')
+f(15,254,17,2,'kyo/core$.kyo$core$$$_$transformLoop$1',8,0,0)
+f(16,254,6,3,'itable stub')
+f(16,260,9,1,'kyo/bench/DeepBindMapBench$$Lambda$66.0x0000000800d0e110.apply')
+f(17,262,7,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$6',7,0,0)
+f(18,262,7,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$7',7,0,0)
+f(19,262,7,2,'scala/runtime/BoxesRunTime.boxToInteger',7,0,0)
+f(20,264,5,2,'java/lang/Integer.valueOf',5,0,0)
+f(16,269,2,2,'kyo/core$$anon$5.<init>',2,0,0)
+f(17,269,2,2,'kyo/core$KyoCont.<init>',2,0,0)
+f(14,271,17,2,'kyo/core$.kyo$core$$$_$transformLoop$1',6,0,0)
+f(15,272,5,3,'itable stub')
+f(15,277,11,1,'kyo/bench/DeepBindMapBench$$Lambda$67.0x0000000800d0e4d8.apply')
+f(16,280,8,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$7',7,0,0)
+f(17,280,8,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$8',7,0,0)
+f(18,280,8,2,'scala/runtime/BoxesRunTime.boxToInteger',7,0,0)
+f(19,284,4,2,'java/lang/Integer.valueOf',3,0,0)
+f(20,287,1,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(21,287,1,4,'InstanceKlass::allocate_instance(JavaThread*)')
+f(22,287,1,4,'MemAllocator::allocate() const')
+f(23,287,1,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(24,287,1,4,'G1CollectedHeap::allocate_new_tlab(unsigned long, unsigned long, unsigned long*)')
+f(25,287,1,4,'G1CollectedHeap::attempt_allocation_slow(unsigned long)')
+f(26,287,1,4,'MutatorAllocRegion::retire(bool)')
+f(27,287,1,4,'G1CollectedHeap::retire_mutator_alloc_region(HeapRegion*, unsigned long)')
+f(28,287,1,4,'G1CollectionSet::add_eden_region(HeapRegion*)')
+f(13,288,27,2,'kyo/core$.kyo$core$$$_$transformLoop$1',12,0,0)
+f(14,289,8,3,'itable stub')
+f(14,297,15,1,'kyo/bench/DeepBindMapBench$$Lambda$68.0x0000000800d0e8a0.apply')
+f(15,306,6,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$8',6,0,0)
+f(16,306,6,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$9',6,0,0)
+f(17,306,6,2,'scala/runtime/BoxesRunTime.boxToInteger',6,0,0)
+f(18,310,2,2,'java/lang/Integer.valueOf',2,0,0)
+f(14,312,3,2,'kyo/core$$anon$5.<init>',3,0,0)
+f(15,312,3,2,'kyo/core$KyoCont.<init>',3,0,0)
+f(12,315,12,2,'kyo/core$.kyo$core$$$_$transformLoop$1',6,0,0)
+f(13,316,5,3,'itable stub')
+f(13,321,6,1,'kyo/bench/DeepBindMapBench$$Lambda$69.0x0000000800d0ec68.apply')
+f(14,324,3,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$9',3,0,0)
+f(15,324,3,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$10',3,0,0)
+f(16,324,3,2,'scala/runtime/BoxesRunTime.boxToInteger',3,0,0)
+f(17,326,1,2,'java/lang/Integer.valueOf',1,0,0)
+f(11,327,9,1,'kyo/core$.kyo$core$$$_$transformLoop$1',1,0,0)
+f(12,327,8,1,'kyo/bench/DeepBindMapBench$$Lambda$70.0x0000000800d0f030.apply')
+f(13,328,7,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$10',7,0,0)
+f(14,328,7,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$11',7,0,0)
+f(15,328,7,2,'scala/runtime/BoxesRunTime.boxToInteger',7,0,0)
+f(16,331,4,2,'java/lang/Integer.valueOf',4,0,0)
+f(12,335,1,2,'kyo/core$$anon$5.<init>',1,0,0)
+f(13,335,1,2,'kyo/core$KyoCont.<init>',1,0,0)
+f(10,336,11,1,'kyo/core$.kyo$core$$$_$transformLoop$1')
+f(11,336,11,1,'kyo/bench/DeepBindMapBench$$Lambda$71.0x0000000800d0f3f8.apply')
+f(12,336,11,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$adapted$11',11,0,0)
+f(13,336,11,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1$$anonfun$12',11,0,0)
+f(14,336,11,2,'kyo/bench/DeepBindMapBench.loop$1',11,0,0)
+f(15,336,4,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',4,0,0)
+f(16,336,4,2,'java/lang/invoke/LambdaForm$DMH.0x0000000800cf8c00.newInvokeSpecial',4,0,0)
+f(17,336,1,2,'java/lang/invoke/DirectMethodHandle.allocateInstance',1,0,0)
+f(17,337,3,2,'kyo/bench/DeepBindMapBench$$Lambda$59.0x0000000800d0c8b0.<init>',3,0,0)
+f(15,340,7,2,'kyo/ios$IOs.apply',7,0,0)
+f(16,346,1,2,'kyo/ios$IOs$$anon$4.<init>',1,0,0)
+f(9,347,141,1,'kyo/ios$IOs$$anon$4.apply')
+f(10,353,135,2,'kyo/ios$IOs$$anon$4.apply',135,0,0)
+f(11,354,134,2,'kyo/bench/DeepBindMapBench$$Lambda$59.0x0000000800d0c8b0.apply',134,0,0)
+f(12,358,130,2,'kyo/bench/DeepBindMapBench.loop$1$$anonfun$1',130,0,0)
+f(13,374,51,2,'java/lang/invoke/Invokers$Holder.linkToTargetMethod',51,0,0)
+f(14,374,51,2,'java/lang/invoke/DirectMethodHandle$Holder.newInvokeSpecial',51,0,0)
+f(15,396,29,2,'kyo/bench/DeepBindMapBench$$Lambda$60.0x0000000800d0cb70.<init>',29,0,0)
+f(16,408,17,2,'java/lang/Object.<init>',17,0,0)
+f(13,425,8,2,'kyo/ios$IOs.apply',8,0,0)
+f(14,429,4,2,'scala/util/NotGiven$.value',4,0,0)
+f(13,433,55,2,'scala/runtime/BoxesRunTime.boxToInteger',55,0,0)
+f(7,488,1,1,'kyo/concurrent/scheduler/Queue.poll')
+f(8,488,1,2,'scala/collection/mutable/PriorityQueue.dequeue',1,0,0)
+f(7,489,2,1,'kyo/concurrent/scheduler/Scheduler$.idle')
+f(8,489,2,1,'kyo/concurrent/scheduler/Worker.park')
+f(9,489,2,1,'java/util/concurrent/locks/LockSupport.parkNanos')
+f(10,489,2,1,'jdk/internal/misc/Unsafe.park')
+f(11,489,1,3,'Unsafe_Park')
+f(12,489,1,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(13,489,1,5,'entry_SYSCALL_64_after_hwframe')
+f(14,489,1,5,'do_syscall_64')
+f(15,489,1,5,'__x64_sys_futex')
+f(16,489,1,5,'do_futex')
+f(17,489,1,5,'futex_wake')
+f(11,490,1,3,'[unknown]')
+f(12,490,1,3,'/usr/lib/x86_64-linux-gnu/libc.so.6')
+f(13,490,1,5,'entry_SYSCALL_64_after_hwframe')
+f(14,490,1,5,'do_syscall_64')
+f(15,490,1,5,'__x64_sys_futex')
+f(16,490,1,5,'do_futex')
+f(17,490,1,5,'futex_wait')
+f(18,490,1,5,'futex_wait_queue_me')
+f(19,490,1,5,'hrtimer_sleeper_start_expires')
+f(20,490,1,5,'_raw_spin_unlock_irqrestore')
+
+search();
+</script></body></html>
